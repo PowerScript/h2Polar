@@ -25,4 +25,4 @@ set your http client with pac script: http://127.0.0.1:51234/h2Polar.pac.
 * REDIRECT - redirect domains
 
 ## build
-    gcc h2polar.c -o h2polar.exe -pthread -lssl -lcrypto -lgdi32 -lws2_32 -lGdiplus -Wall -DDEBUG -DDNS_MEM_CACHE -DCA_MEM_CACHE -DOPENSSL
+    gcc h2polar.c -o h2polar.exe -pthread -lssl -lcrypto -lgdi32 -lws2_32 -lGdiplus -Wall -static -DDEBUG -DDNS_MEM_CACHE -DCA_MEM_CACHE -DOPENSSL
