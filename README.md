@@ -11,8 +11,8 @@ only windows is support for now.
 ## https
 install _h2Polar.cer_ on your system to allow ssl traffic.
 
-## pac
-set your client proxy pac with http://127.0.0.1:51234/h2Polar.pac.
+## pac script
+set your http client with pac script: http://127.0.0.1:51234/h2Polar.pac.
 
 ## traffic features
 * CAPTURE - log traffic
