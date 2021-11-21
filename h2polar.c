@@ -46,20 +46,20 @@
 	#define __POOL_NTHREAD              20
 #endif
 #define __AUTHOR                        "RedToor"
-#define __VERSION                       "2021.10.30.2346"
+#define __VERSION                       "2021.11.21.1437"
 #define __CAPTURE_FILE                  "h2Polar.log"
 #define __DOWNLOAD_FOLDER               "%s"
-#define __RULES_FILE                    "rules.txt"
+#define __CONFIG_FILE                    "h2polar.cfg"
 #define __PAC_FILE                      "/h2Polar.pac"
 #define __INIT_SIZE_BUFFER              8192
-#define __INIT_SIZE_BUFFER_CHUNK        8192
 #define __INTERFACE_BIND                "127.0.0.1"
-#define __TIMEOUT_IO                    30000
-#define __TIMEOUT_IO_WS                 30
+#define __TIMEOUT_CONNECT               4
+#define __TIMEOUT_TUNNEL                30
 #define __PORT_BIND                     51234
 #define __MAX_CLIENT                    100
 
 #define COMMENT_RULE                    '#'
+#define SETTING_FORMAT                  "%s = %s[^\n]\n"
 #define DELIMITER_RULE_INFO             "|"
 #define DELIMITER_RULE                  "\r\n"
 #define DOWNLOAD_CONTENT_SLASH_REMPLACE ','
@@ -92,6 +92,15 @@ typedef int bool;
 	} thread_pool, *pthread_pool;
 #endif
 
+enum {
+	_INTERFACE,
+	PORT,
+	POOL_NTHREADS,
+	TIMEOUT_CONNECT,
+	TIMEOUT_TUNNEL,
+	INIT_BUFFER_SIZE
+};
+
 typedef enum 
 {
 	INIT,
@@ -108,6 +117,7 @@ typedef enum {
 
 typedef enum  {
 	UNKNOW,
+	ALL,
 	CONNECT,
 	GET,
 	PUT,
@@ -119,7 +129,7 @@ typedef enum  {
 typedef enum {
 	DIRECT,
 	CAPTURE,
-	INJECT,
+	MODIFY_BODY_RESPONSE,
 	REDIRECT,
 	REJECT,
 	SCREENSHOT,
@@ -136,7 +146,7 @@ typedef struct {
 	int port;
 	char method[8];
 	char version_protocol;
-} header, *pheader;
+} reqinfo, *preqinfo;
 
 typedef struct {
 	bool chunked;
@@ -148,13 +158,20 @@ typedef struct {
 	char* content_length_offset;
 	char content_type[MAX_STR_VALUE_HEADER_SIZE];
 	char upgrade[MAX_STR_VALUE_HEADER_SIZE];
-} reqinfo, *preqinfo;
+} headers, *pheaders;
 
 typedef struct {
 	char* pointer;
 	u_int written;
 	u_int size_block;
 } buffer, *pbuffer;
+
+typedef struct _domain_cache
+{
+	char domain[MAX_HOSTNAME_SIZE];
+	u_long ip;
+	struct _domain_cache* next;
+} domain_cache, *pdomain_cache;
 
 typedef struct 
 {
@@ -180,6 +197,31 @@ typedef struct
 	u_int inject_length;
 } injection, *pinjection;
 
+typedef struct 
+{
+	char name[24];
+	char value[1024];
+	u_int name_length;
+	u_int value_length;
+} head, *phead;
+
+typedef struct _rule {
+	PROXY_ACTION action;
+	char domain[MAX_HOSTNAME_SIZE];
+	char url[MAX_URL_SIZE];
+	bool ssl;
+	u_int port;
+	u_int method;
+	void* extra_data;
+	struct _rule* next;
+} rule, *prule;
+
+typedef struct _action {
+	PROXY_ACTION action;
+	void* extra_data;
+	struct _action* next;
+} action, *paction;
+
 #ifdef OPENSSL
 	char hex_map[] = { '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'A', 'B', 'C', 'D', 'E', 'F' };
 	u_char alpn_protocol[] = { 8, 'h', 't', 't', 'p', '/', '1', '.', '1' };
@@ -199,30 +241,6 @@ typedef struct
 	} ssl_layer, *pssl_layer;
 #endif
 
-typedef struct _rule {
-	PROXY_ACTION action;
-	char domain[MAX_HOSTNAME_SIZE];
-	char url[MAX_URL_SIZE];
-	bool ssl;
-	u_int port;
-	u_int method;
-	void* extra_data;
-	struct _rule* next;
-} rule, *prule;
-
-typedef struct _action {
-	PROXY_ACTION action;
-	void* extra_data;
-	struct _action* next;
-} action, *paction;
-
-typedef struct _domain_cache
-{
-	char domain[MAX_HOSTNAME_SIZE];
-	u_long ip;
-	struct _domain_cache* next;
-} domain_cache, *pdomain_cache;
-
 typedef struct {
 	int error_code;
 	int sock_browser;
@@ -236,9 +254,9 @@ typedef struct {
 	buffer head_response;
 	buffer body_response;
 	paction actions;
-	header Head;
-	reqinfo headers_request;
-	reqinfo headers_response;
+	reqinfo info;
+	headers headers_request;
+	headers headers_response;
 	DWORD thread_id;
 	bool ssl;
 	bool connection_established;
@@ -251,6 +269,12 @@ typedef struct {
 } client, *pclient;
 
 struct {
+	char _interface[20];
+	u_int port;
+	u_int nthreads;
+	u_long timeout_connect;
+	u_long timeout_tunnel;
+	u_int init_buffer_size;
 	#ifdef OPENSSL
 		X509* certificate;
 		EVP_PKEY* client_key;
@@ -269,10 +293,8 @@ struct {
 	CRITICAL_SECTION certificate_cache_lock;
 	pdomain_cache domain_cache;
 	HANDLE proxy_thread;
-	u_long timeout;
 	SOCKET socket;
 	prule proxy_rules;
-	bool proxy_state;
 	buffer pac_request;
 } proxy_config, *pproxy_config;
 
@@ -314,11 +336,13 @@ struct {
 	char* pac_response_3;
 } const_char, *pconst_char;
 
-char* PROXY_ACTIONS[] = { [DIRECT] = "DIRECT", [CAPTURE] = "CAPTURE", [INJECT] = "INJECT", [REDIRECT] = "REDIRECT", 
+char* PROXY_ACTIONS[] = { [DIRECT] = "DIRECT", [CAPTURE] = "CAPTURE", [MODIFY_BODY_RESPONSE] = "MODIFY_BODY_RESPONSE", [REDIRECT] = "REDIRECT", 
 						  [REJECT] = "REJECT", [SCREENSHOT] = "SCREENSHOT", [FAKE_TLS_EXT_HOSTNAME] = "FAKE_TLS_EXT_HOSTNAME", 
 						  [REMOVE_HEADER_REQUEST] = "REMOVE_HEADER_REQUEST", [REMOVE_HEADER_RESPONSE] = "REMOVE_HEADER_RESPONSE",
 						  [DOWNLOAD_CONTENT] = "DOWNLOAD_CONTENT" };
-char* PROXY_METHODS[] = { [UNKNOW] = "UNKNOW", [CONNECT] = "CONNECT", [GET] = "GET", [PUT] = "PUT", [POST] = "POST", [HEAD] = "HEAD", [DELETE_] = "DELETE" };
+char* PROXY_METHODS[] = { [UNKNOW] = "UNKNOW", [ALL] = "ALL", [CONNECT] = "CONNECT", [GET] = "GET", [PUT] = "PUT", [POST] = "POST", [HEAD] = "HEAD", [DELETE_] = "DELETE" };
+char* KEY_SETTING[] = {   [_INTERFACE] = "INTERFACE", [PORT] = "PORT", [POOL_NTHREADS] = "POOL_NTHREADS", [TIMEOUT_CONNECT] = "TIMEOUT_CONNECT",
+						  [TIMEOUT_TUNNEL] = "TIMEOUT_TUNNEL", [INIT_BUFFER_SIZE] = "INIT_BUFFER_SIZE" };
 
 #define RETN_OK return true;
 #define RETN_FAIL return false;
@@ -336,7 +360,7 @@ char* PROXY_METHODS[] = { [UNKNOW] = "UNKNOW", [CONNECT] = "CONNECT", [GET] = "G
 #define ADD_ITEM(array, item) if (array == 0){ array = item; } else { item->next = array; } array = item;
 #define ITER_LLIST(item, array) for (item=array; item; item=item->next)
 #define TRY_EXECUTION(execute) if (!execute) goto __exception;
-#define IF_EXTRADATA(action) action == INJECT || REDIRECT == action || action == FAKE_TLS_EXT_HOSTNAME || DOWNLOAD_CONTENT == action
+#define IF_EXTRADATA(action) action == MODIFY_BODY_RESPONSE || REDIRECT == action || action == FAKE_TLS_EXT_HOSTNAME || DOWNLOAD_CONTENT == action
 
 #define ADD_ACTION(actions, naction) ADD_ITEM(actions, naction)
 #define ADD_RULE(nrule) ADD_ITEM(proxy_config.proxy_rules, nrule)
@@ -352,6 +376,11 @@ char* PROXY_METHODS[] = { [UNKNOW] = "UNKNOW", [CONNECT] = "CONNECT", [GET] = "G
 
 void load_strings()
 {
+	strcpy(proxy_config._interface, __INTERFACE_BIND);
+	proxy_config.port = __PORT_BIND;
+	proxy_config.timeout_connect = __TIMEOUT_CONNECT;
+	proxy_config.timeout_tunnel = __TIMEOUT_TUNNEL;
+	proxy_config.init_buffer_size = __INIT_SIZE_BUFFER;
 	const_char.http_get = "GET";
 	const_char.http_post = "POST";
 	const_char.http_connect = "CONNECT";
@@ -385,7 +414,7 @@ void load_strings()
 	const_char.head_connection_established = "HTTP/1.1 200 Connection established\r\n\r\n";
 	const_char.pac_response_1 = "function FindProxyForURL(url, host){if(";
 	const_char.pac_response_2 = "dnsDomainIs(host, \"%s\")||";
-	const_char.pac_response_3 = "){return \"PROXY " __INTERFACE_BIND ":" IN2STR(__PORT_BIND) "\"}return \"DIRECT\"}";
+	const_char.pac_response_3 = "){return \"PROXY %s:%d\"}return \"DIRECT\"}";
 	const_char.phttpsd2s = "https://";
 }
 
@@ -507,7 +536,7 @@ void load_strings()
 			RETN_FAIL
 		}
 		if ((request->error_code = SSL_set_fd(request->ssl_page->connection, request->sock_page) <= 0)) goto __exception;
-		if ((request->error_code = SSL_set_tlsext_host_name(request->ssl_page->connection, request->Head.tls_ext_hostname)) <= 0) goto __exception;
+		if ((request->error_code = SSL_set_tlsext_host_name(request->ssl_page->connection, request->info.tls_ext_hostname)) <= 0) goto __exception;
 		SSL_set_alpn_protos(request->ssl_page->connection, alpn_protocol, lentgh);
 		if ((request->error_code = SSL_connect(request->ssl_page->connection)) <= 0) goto __exception;
 		if ((request->ssl_page->certificate = SSL_get_peer_certificate(request->ssl_page->connection)) <= 0) goto __exception;
@@ -581,8 +610,8 @@ void load_strings()
 		IF_GZERO(send(request->sock_browser, const_char.head_connection_established, 39, 0));
 		IF_GZERO(browser_ssl_handshake(request))
 		request->head_request.written = 0;
-		memset((void*)&request->Head.url, 0, MAX_URL_SIZE);
-		memset((void*)&request->headers_request, 0, sizeof(reqinfo));
+		memset((void*)&request->info.url, 0, MAX_URL_SIZE);
+		memset((void*)&request->headers_request, 0, sizeof(headers));
 		RETN_OK
 	}
 #endif
@@ -604,6 +633,20 @@ char* strnstr(char* hay, int haysize, char* needle, int needlesize)
 		}
 	}
 	RETN_FAIL
+}
+
+int get_num_dig(unsigned size)
+{
+	if (size >= 1000000000) return 10;
+	if (size >= 100000000) return 9;
+	if (size >= 10000000) return 8;
+	if (size >= 1000000) return 7;
+	if (size >= 100000) return 6;
+	if (size >= 10000) return 5;
+	if (size >= 1000) return 4;
+	if (size >= 100) return 3;
+	if (size >= 10) return 2;
+	return 1;
 }
 
 #ifdef DEBUG
@@ -718,10 +761,9 @@ bool generate_bmp(int x, int y, int width, int height)
 	RETN_OK
 }
 
-bool Compare(char* init, int count, char* str, int count2)
+bool compare(char* init, int count, char* str, int count2)
 {
 	if (count2 == 0) RETN_OK
-	if (count2 == 1){ if (str[0] == '*'){ RETN_OK }}
 	if (count != count2) RETN_FAIL
 	for (int i = 0; i < count; ++i){
 		if (init[i] != str[i]) RETN_FAIL
@@ -754,7 +796,7 @@ bool check_filter(char* mask_filter, char* str, char delimiter)
 				end = true;
 				break;
 			}
-			if (Compare(str + read, count, mask_filter + read2, count2) == false) RETN_FAIL
+			if (compare(str + read, count, mask_filter + read2, count2) == false) RETN_FAIL
 			read += count + 1;
 			read2 += count2 + 1;
 			count = 0;
@@ -769,7 +811,7 @@ void generate_pac_response()
 	prule proxy_rule = 0;
 	u_int body_length = 0;
 
-	body_length = 39 + 49;
+	body_length = 39 + 35 + strlen(proxy_config._interface) + get_num_dig(proxy_config.port);
 	ITER_LLIST(proxy_rule, proxy_config.proxy_rules){
 		body_length += strlen(proxy_rule->domain) + 23;
 	}
@@ -785,22 +827,8 @@ void generate_pac_response()
 		proxy_config.pac_request.written += strlen(proxy_rule->domain) + 23;
 	}
 	proxy_config.pac_request.written -= 2;
-	sprintf(proxy_config.pac_request.pointer + proxy_config.pac_request.written, const_char.pac_response_3);
-	proxy_config.pac_request.written += strlen(const_char.pac_response_3);
-}
-
-int get_num_dig(unsigned size)
-{
-	if (size >= 1000000000) return 10;
-	if (size >= 100000000) return 9;
-	if (size >= 10000000) return 8;
-	if (size >= 1000000) return 7;
-	if (size >= 100000) return 6;
-	if (size >= 10000) return 5;
-	if (size >= 1000) return 4;
-	if (size >= 100) return 3;
-	if (size >= 10) return 2;
-	return 1;
+	sprintf(proxy_config.pac_request.pointer + proxy_config.pac_request.written, const_char.pac_response_3, proxy_config._interface, proxy_config.port);
+	proxy_config.pac_request.written += strlen(proxy_config.pac_request.pointer + proxy_config.pac_request.written);
 }
 
 void free_proxy_actions(pclient request)
@@ -875,7 +903,10 @@ void close_handle(pclient request)
 
 bool get_method(char* buffer, u_int* method)
 {
-	if (strncmp(buffer, PROXY_METHODS[GET], 3) == 0){
+	if (strncmp(buffer, PROXY_METHODS[ALL], 3) == 0){
+		*method = ALL;
+		RETN_OK
+	} else if (strncmp(buffer, PROXY_METHODS[GET], 3) == 0){
 		*method = GET;
 		RETN_OK
 	}else if (strncmp(buffer, PROXY_METHODS[POST], 4) == 0){
@@ -983,7 +1014,7 @@ bool get_body_request(bool is_ssl, int socket, pssl_layer ssl, pbuffer buffer, i
 	while (buffer->written != content_length){
 		IF_GZERO(incomming_buffer = input_buffer(is_ssl, socket, ssl, buffer->pointer + buffer->written, content_length - buffer->written))
 		if (request != 0){
-			if (request->action != INJECT){
+			if (request->action != MODIFY_BODY_RESPONSE){
 				IF_GZERO(send_buffer(request->ssl, request->sock_browser, request->ssl_browser, buffer->pointer + buffer->written, incomming_buffer))
 			}
 		}
@@ -1009,13 +1040,13 @@ bool get_headers_request(bool is_ssl, int socket, pssl_layer ssl, pbuffer buffer
 	RETN_FAIL
 }
 
-bool parse_headers(pbuffer buffer, preqinfo reqinfo)
+bool parse_headers(pbuffer buffer, pheaders header)
 {
 	char* token = 0;
 	char* token_name = 0;
 	char* token_end = 0;
 	int header_lentgh = 0;
-	int value_lentgh = 0;
+	int value_length = 0;
 
 	token = strnstr(buffer->pointer, buffer->written, "\n", 1);
 	while (token != 0){
@@ -1025,27 +1056,27 @@ bool parse_headers(pbuffer buffer, preqinfo reqinfo)
 			break;
 		}
 		token_name = strstr(token + 1, ":");
-		value_lentgh = (token_name - token) + 1;
+		value_length = (token_name - token) + 1;
 		//printer(token + 1, (token_name - token) + 1);
-		//printer(token_name + 1, header_lentgh - value_lentgh + 1);
+		//printer(token_name + 1, header_lentgh - value_length + 1);
 		if (strnstr(token + 1, (token_name - token) + 1, const_char.content_lentgh, 15)){
-			if (sscanf(token + 1, const_char.format_int_value_header, &reqinfo->content_length) == 1){
-				reqinfo->content_length_offset = token + 17;
+			if (sscanf(token + 1, const_char.format_int_value_header, &header->content_length) == 1){
+				header->content_length_offset = token + 17;
 			}
 		} else if (strnstr(token + 1, (token_name - token) + 1, const_char.transfer_encoding, 18)){
-			if (strnstr(token_name + 1, header_lentgh - value_lentgh + 1, const_char.chunked, 7)){
-				reqinfo->chunked = true;
+			if (strnstr(token_name + 1, header_lentgh - value_length + 1, const_char.chunked, 7)){
+				header->chunked = true;
 			}
 		} else if (strnstr(token + 1, (token_name - token) + 1, const_char.connection, 11)){
-			if (strnstr(token_name + 1, header_lentgh - value_lentgh + 1, const_char.keep_alive, 10)){
-				reqinfo->connection.keep_alive = true;
-			} else if (strnstr(token_name + 1, header_lentgh - value_lentgh + 1, const_char.upgrade, 7)){
-				reqinfo->connection.upgrade = true;
+			if (strnstr(token_name + 1, header_lentgh - value_length + 1, const_char.keep_alive, 10)){
+				header->connection.keep_alive = true;
+			} else if (strnstr(token_name + 1, header_lentgh - value_length + 1, const_char.upgrade, 7)){
+				header->connection.upgrade = true;
 			}
 		} else if (strnstr(token + 1, (token_name - token) + 1, const_char.content_type, 13)){
-			sscanf(token + 1, const_char.format_str_value_header, reqinfo->content_type);
+			sscanf(token + 1, const_char.format_str_value_header, header->content_type);
 		} else if (strnstr(token + 1, (token_name - token) + 1, const_char.upgrade, 8)){
-			sscanf(token + 1, const_char.format_str_value_header, reqinfo->upgrade);
+			sscanf(token + 1, const_char.format_str_value_header, header->upgrade);
 		}
 		token = token_end;
 	}
@@ -1055,14 +1086,14 @@ bool parse_headers(pbuffer buffer, preqinfo reqinfo)
 bool get_request(pclient request)
 {
 	LOGGER("--->getting http request")
+	request->stage = HEAD_REQUEST;
 	IF_GZERO(get_headers_request(request->ssl, request->sock_browser, request->ssl_browser, &request->head_request))
 	IF_GZERO(get_method(request->head_request.pointer, &request->method))
 	parse_headers(&request->head_request, &request->headers_request);
-	request->stage = HEAD_REQUEST;
+	request->stage = BODY_REQUEST;
 	if (request->method == POST && request->headers_request.content_length > 0){
 		IF_GZERO(get_body_request(request->ssl, request->sock_browser, request->ssl_browser, &request->body_request, request->headers_request.content_length, 0))
 	}
-	request->stage = BODY_REQUEST;
 	RETN_OK
 }
 
@@ -1077,9 +1108,9 @@ void reset_request(pclient request)
 	request->action = DIRECT;
 	request->stage = INIT_KEEPALIVE;
 	request->nrequests++;
-	memset(request->Head.url, 0, MAX_URL_SIZE);
-	memset((void*)&request->headers_request, 0, sizeof(reqinfo));
-	memset((void*)&request->headers_response, 0, sizeof(reqinfo));
+	memset(request->info.url, 0, MAX_URL_SIZE);
+	memset((void*)&request->headers_request, 0, sizeof(headers));
+	memset((void*)&request->headers_response, 0, sizeof(headers));
 	free_proxy_actions(request);
 	request->actions = 0;
 }
@@ -1089,16 +1120,16 @@ bool alloc_request(pclient* request)
 	LOGGER("+>allocating request")
 
 	CHECK_ALLOC(client, calloc, *request, 1)
-	CHECK_ALLOC(char, calloc, (*request)->head_request.pointer, __INIT_SIZE_BUFFER)
+	CHECK_ALLOC(char, calloc, (*request)->head_request.pointer, proxy_config.init_buffer_size)
 	(*request)->stage = INIT;
 	(*request)->method = UNKNOW;
 	(*request)->action = DIRECT;
 	(*request)->sock_browser = 0;
 	(*request)->sock_page = 0;
-	(*request)->Head.port = 80;
+	(*request)->info.port = 80;
 	(*request)->connection_established = false;
 	(*request)->ssl = false;
-	(*request)->head_request.size_block = __INIT_SIZE_BUFFER;
+	(*request)->head_request.size_block = proxy_config.init_buffer_size;
 	RETN_OK
 }
 
@@ -1111,47 +1142,47 @@ bool get_info_request(pclient request)
 	int index = 0;
 
 	if (!(lentgh = strcspn(request->head_request.pointer, " "))) RETN_FAIL
-	strncpy(request->Head.method, request->head_request.pointer, lentgh);
+	strncpy(request->info.method, request->head_request.pointer, lentgh);
 	method_lentgh = lentgh + 1;
 	if (!(token = strstr(request->head_request.pointer, "\r\n"))) RETN_FAIL
 	lentgh = token - request->head_request.pointer - 1;
-	request->Head.version_protocol = request->head_request.pointer[lentgh];
-	request->Head.port = request->ssl ? request->Head.port : 80;
+	request->info.version_protocol = request->head_request.pointer[lentgh];
+	request->info.port = request->ssl ? request->info.port : 80;
 	lentgh -= 8 + method_lentgh;
 	token += 2;
-	if(lentgh >= sizeof(request->Head.url)){
-		lentgh = sizeof(request->Head.url) - 1;
+	if(lentgh >= sizeof(request->info.url)){
+		lentgh = sizeof(request->info.url) - 1;
 	}
-	strncpy(request->Head.url, request->head_request.pointer + method_lentgh, lentgh);
+	strncpy(request->info.url, request->head_request.pointer + method_lentgh, lentgh);
 	if ((token = strstr(token, const_char.hostname))){
 		lentgh = strstr(token, "\r\n") - token - 6;
-		strncpy(request->Head.hostname, token + 6, lentgh);
-		if ((token = strstr(request->Head.hostname, ":"))){
-			sscanf(token + 1, "%d", &request->Head.port);
+		strncpy(request->info.hostname, token + 6, lentgh);
+		if ((token = strstr(request->info.hostname, ":"))){
+			sscanf(token + 1, "%d", &request->info.port);
 			*token = '\0';
 		}
-		strcpy(request->Head.tls_ext_hostname, request->Head.hostname);
+		strcpy(request->info.tls_ext_hostname, request->info.hostname);
 	}
-	if (strncmp(request->Head.method, const_char.http_connect, 7) == 0){
+	if (strncmp(request->info.method, const_char.http_connect, 7) == 0){
 		request->ssl = true;
-		if (*request->Head.url != '/'){
-			strcpy(request->Head.url, "/");
+		if (*request->info.url != '/'){
+			strcpy(request->info.url, "/");
 		}
 		RETN_OK
 	}
-	if (*request->Head.url != '/'){
-		if (request->Head.url[5] == 's' || 'S' == request->Head.url[5]){
+	if (*request->info.url != '/'){
+		if (request->info.url[5] == 's' || 'S' == request->info.url[5]){
 			request->ssl = true;
 		}
-		lentgh = strcspn(request->Head.url + 8, "/") + 8;
-		url_lentgh = strlen(request->Head.url) - lentgh + 1;
-		memmove(request->Head.url, request->Head.url + lentgh, url_lentgh);
+		lentgh = strcspn(request->info.url + 8, "/") + 8;
+		url_lentgh = strlen(request->info.url) - lentgh + 1;
+		memmove(request->info.url, request->info.url + lentgh, url_lentgh);
 		memmove(request->head_request.pointer + method_lentgh, request->head_request.pointer + method_lentgh + lentgh, request->head_request.written - lentgh);
 		request->head_request.written -= lentgh;
 	}
-	for (index = 0; index < strlen(request->Head.url); ++index){
-		if (request->Head.url[index] == '?' || ';' == request->Head.url[index] || request->Head.url[index] == '#'){
-			request->Head.url[index] = '\0';
+	for (index = 0; index < strlen(request->info.url); ++index){
+		if (request->info.url[index] == '?' || ';' == request->info.url[index] || request->info.url[index] == '#'){
+			request->info.url[index] = '\0';
 			break;
 		}
 	}
@@ -1225,14 +1256,25 @@ bool lookup_domain(struct sockaddr_in* sockinfo, char* domain)
 	#endif
 }
 
+bool set_socket_timeout(int socket, u_int timeout)
+{
+	u_long ltimeout = timeout;
+
+	IF_ZERO(setsockopt(socket, SOL_SOCKET, SO_RCVTIMEO, (void*)&ltimeout, sizeof(u_long)))
+	ltimeout = timeout;
+	IF_ZERO(setsockopt(socket, SOL_SOCKET, SO_SNDTIMEO, (void*)&ltimeout, sizeof(u_long)))
+	RETN_OK
+}
+
 bool socket_connection(pclient request)
 {
 	struct sockaddr_in page = {0};
 
-	IF_GZERO(lookup_domain(&page, request->Head.hostname))
+	IF_GZERO(lookup_domain(&page, request->info.hostname))
 	IF_GZERO(request->sock_page = socket(2, 1, 0))
-	page.sin_port = htons(request->Head.port);
+	page.sin_port = htons(request->info.port);
 	page.sin_family = 2;
+	set_socket_timeout(request->sock_page, proxy_config.timeout_connect);
 	if (connect(request->sock_page, (struct sockaddr*)&page, sizeof(page)) != SOCKET_ERROR){
 		RETN_OK
 	}
@@ -1244,44 +1286,6 @@ bool send_pac_response(pclient request)
 	LOGGER("->pac request")
 	IF_GZERO(send_buffer(false, request->sock_browser, 0, proxy_config.pac_request.pointer, proxy_config.pac_request.written))
 	request->action = REJECT;
-	RETN_OK
-}
-
-bool check_action(pclient request)
-{
-	LOGGER("--->checking rules")
-	paction naction = 0;
-	prule proxy_rule = 0;
-
-	if (!strcmp(request->Head.url, __PAC_FILE) && __PORT_BIND == request->Head.port && !strcmp(request->Head.hostname, __INTERFACE_BIND)){
-		send_pac_response(request);
-		RETN_OK
-	}
-	ITER_LLIST(proxy_rule, proxy_config.proxy_rules){
-		if (check_filter(proxy_rule->domain, request->Head.hostname, '.') &&
-			check_filter(proxy_rule->url, request->Head.url, '/') &&
-			proxy_rule->method == request->method &&
-			proxy_rule->port == request->Head.port && 
-			proxy_rule->ssl == request->ssl){
-			CHECK_ALLOC(action, calloc, naction, 1)
-			naction->action = proxy_rule->action;
-			if (naction->action == INJECT){
-				CHECK_ALLOC(injection, calloc, naction->extra_data, 1)
-				memcpy(naction->extra_data, proxy_rule->extra_data, sizeof(injection));
-			} else if (naction->action == REDIRECT){
-				CHECK_ALLOC(redirect, calloc, naction->extra_data, 1)
-				memcpy(naction->extra_data, proxy_rule->extra_data, sizeof(redirect));
-			} else if (naction->action == FAKE_TLS_EXT_HOSTNAME){
-				CHECK_ALLOC(fake_tls_ext_hostname, calloc, naction->extra_data, 1)
-				memcpy(naction->extra_data, proxy_rule->extra_data, sizeof(fake_tls_ext_hostname));
-			} else if (naction->action == DOWNLOAD_CONTENT){
-				CHECK_ALLOC(download_content, calloc, naction->extra_data, 1)
-				memcpy(naction->extra_data, proxy_rule->extra_data, sizeof(download_content));
-			}
-			ADD_ACTION(request->actions, naction);
-			LOGGER("--->rule reached, an action was added: M[%s]SSL[%s]A[%s] :%d:%s:%s", PROXY_METHODS[proxy_rule->method], HTTP_SSL[proxy_rule->ssl], PROXY_ACTIONS[proxy_rule->action], proxy_rule->port, proxy_rule->domain, proxy_rule->url)
-		}
-	}
 	RETN_OK
 }
 
@@ -1384,9 +1388,9 @@ bool apply_capture(pclient request)
 bool apply_redirect(pclient request, predirect redirect)
 {
 	if (request->stage == BODY_REQUEST){
-		LOGGER("----->redirecting %s:%d -> %s:%d", request->Head.hostname, request->Head.port, redirect->hostname, redirect->port);
-		strcpy(request->Head.hostname, redirect->hostname);
-		request->Head.port = redirect->port;
+		LOGGER("----->redirecting %s:%d -> %s:%d", request->info.hostname, request->info.port, redirect->hostname, redirect->port);
+		strcpy(request->info.hostname, redirect->hostname);
+		request->info.port = redirect->port;
 	}
 	RETN_OK
 }
@@ -1394,8 +1398,8 @@ bool apply_redirect(pclient request, predirect redirect)
 bool apply_fake_tls_hostname(pclient request, pfake_tls_ext_hostname fake_tls_ext_hostname)
 {
 	if (request->stage == BODY_REQUEST){
-		LOGGER("----->fake tls ext hostname %s -> %s", request->Head.hostname, fake_tls_ext_hostname->hostname);
-		strcpy(request->Head.tls_ext_hostname, fake_tls_ext_hostname->hostname);
+		LOGGER("----->fake tls ext hostname %s -> %s", request->info.hostname, fake_tls_ext_hostname->hostname);
+		strcpy(request->info.tls_ext_hostname, fake_tls_ext_hostname->hostname);
 	}
 	RETN_OK
 }
@@ -1430,8 +1434,8 @@ bool apply_download_content(pclient request, pdownload_content download_content)
 
 	if (request->stage == BODY_RESPONSE){
 		if (!strcmp(download_content->content_type, request->headers_response.content_type)){
-			LOGGER("----->downloading content %s %s %d bytes %s", request->Head.hostname, request->Head.url, request->body_response.written, download_content->content_type);
-			strcpy(url, request->Head.url);
+			LOGGER("----->downloading content %s %s %d bytes %s", request->info.hostname, request->info.url, request->body_response.written, download_content->content_type);
+			strcpy(url, request->info.url);
 			for (int i = 0; i < strlen(url); ++i){
 				if (url[i] == '/') url[i] = DOWNLOAD_CONTENT_SLASH_REMPLACE;
 			}
@@ -1442,14 +1446,14 @@ bool apply_download_content(pclient request, pdownload_content download_content)
 	RETN_OK
 }
 
-void apply_header_actions(pclient request, PROXY_ACTION action)
+void apply_header_actions(pclient request, PROXY_ACTION action, phead header)
 {
 	if (action == REMOVE_HEADER_REQUEST && BODY_REQUEST == request->stage){
-		LOGGER("----->removing header request");
-		remove_http_header(&request->head_request, const_char.accept_encoding);
-	} else if (action == REMOVE_HEADER_RESPONSE && BODY_RESPONSE == request->stage){
-		LOGGER("----->removing header response");
-		remove_http_header(&request->head_response, "Date");
+		LOGGER("----->removing header request: %s", header->name);
+		remove_http_header(&request->head_request, header->name);
+	} else if (action == REMOVE_HEADER_RESPONSE && HEAD_RESPONSE == request->stage){
+		LOGGER("----->removing header response: %s", header->name);
+		remove_http_header(&request->head_response, header->name);
 	}
 }
 
@@ -1465,8 +1469,8 @@ int apply_action(pclient request)
 			case CAPTURE:
 				apply_capture(request);
 				break;
-			case INJECT:
-				request->action = INJECT;
+			case MODIFY_BODY_RESPONSE:
+				request->action = MODIFY_BODY_RESPONSE;
 				apply_injection(request, ((pinjection)config->extra_data));
 				break;
 			case REDIRECT:
@@ -1482,7 +1486,7 @@ int apply_action(pclient request)
 				break;
 			case REMOVE_HEADER_REQUEST:
 			case REMOVE_HEADER_RESPONSE:
-				apply_header_actions(request, config->action);
+				apply_header_actions(request, config->action, ((phead)config->extra_data));
 				break;
 			case DOWNLOAD_CONTENT:
 				apply_download_content(request, ((pdownload_content)config->extra_data));
@@ -1492,21 +1496,54 @@ int apply_action(pclient request)
 	return request->action;
 }
 
+bool check_action(pclient request)
+{
+	LOGGER("--->checking rules")
+	paction naction = 0;
+	prule proxy_rule = 0;
+
+	if (!strcmp(request->info.url, __PAC_FILE) && proxy_config.port == request->info.port && (!strcmp(request->info.hostname, proxy_config._interface) ||
+		!strcmp(request->info.hostname, __INTERFACE_BIND))){
+		send_pac_response(request);
+		RETN_OK
+	}
+	ITER_LLIST(proxy_rule, proxy_config.proxy_rules){
+		if (check_filter(proxy_rule->domain, request->info.hostname, '.') &&
+			check_filter(proxy_rule->url, request->info.url, '/') &&
+			(proxy_rule->method == request->method || proxy_rule->method == ALL) &&
+			proxy_rule->port == request->info.port && 
+			proxy_rule->ssl == request->ssl){
+			CHECK_ALLOC(action, calloc, naction, 1)
+			naction->action = proxy_rule->action;
+			if (naction->action == MODIFY_BODY_RESPONSE){
+				CHECK_ALLOC(injection, calloc, naction->extra_data, 1)
+				memcpy(naction->extra_data, proxy_rule->extra_data, sizeof(injection));
+			} else if (naction->action == REDIRECT){
+				CHECK_ALLOC(redirect, calloc, naction->extra_data, 1)
+				memcpy(naction->extra_data, proxy_rule->extra_data, sizeof(redirect));
+			} else if (naction->action == FAKE_TLS_EXT_HOSTNAME){
+				CHECK_ALLOC(fake_tls_ext_hostname, calloc, naction->extra_data, 1)
+				memcpy(naction->extra_data, proxy_rule->extra_data, sizeof(fake_tls_ext_hostname));
+			} else if (naction->action == DOWNLOAD_CONTENT){
+				CHECK_ALLOC(download_content, calloc, naction->extra_data, 1)
+				memcpy(naction->extra_data, proxy_rule->extra_data, sizeof(download_content));
+			} else if (naction->action == REMOVE_HEADER_RESPONSE || REMOVE_HEADER_REQUEST == naction->action){
+				CHECK_ALLOC(head, calloc, naction->extra_data, 1)
+				memcpy(naction->extra_data, proxy_rule->extra_data, sizeof(head));
+			}
+			ADD_ACTION(request->actions, naction);
+			LOGGER("--->rule reached, an action was added: M[%s]SSL[%s]A[%s] :%d:%s:%s", PROXY_METHODS[proxy_rule->method], HTTP_SSL[proxy_rule->ssl], PROXY_ACTIONS[proxy_rule->action], proxy_rule->port, proxy_rule->domain, proxy_rule->url)
+		}
+	}
+	RETN_OK
+}
+
 bool send_request(bool is_ssl, int socket, pssl_layer ssl, pbuffer head_buffer, pbuffer body_buffer)
 {
 	IF_GZERO(send_buffer(is_ssl, socket, ssl, head_buffer->pointer, head_buffer->written))
 	if (body_buffer->written > 0){
 		IF_GZERO(send_buffer(is_ssl, socket, ssl, body_buffer->pointer, body_buffer->written))
 	}
-	RETN_OK
-}
-
-bool get_head_response(pclient request)
-{
-	IF_GZERO(get_headers_request(request->ssl, request->sock_page, request->ssl_page, &request->head_response))
-	sscanf(request->head_response.pointer, const_char.parse_response_code, &request->response_code);
-	parse_headers(&request->head_response, &request->headers_response);
-	request->stage = HEAD_RESPONSE;
 	RETN_OK
 }
 
@@ -1519,10 +1556,6 @@ bool get_chunk_data(pclient request)
 	int size_incomming = 0;
 	int total_received = 0;
 
-	if (request->body_response.size_block == 0){
-		CHECK_ALLOC(char, calloc, request->body_response.pointer, __INIT_SIZE_BUFFER_CHUNK)
-		request->body_response.size_block = __INIT_SIZE_BUFFER_CHUNK;
-	}
 	while (true){
 		memset(chunk_size, 0, size_incomming);
 		memset(delimiter, 0, 3);
@@ -1537,12 +1570,12 @@ bool get_chunk_data(pclient request)
 		if (sscanf(chunk_size, "%x\r\n", &size) != 1) RETN_FAIL
 		if (size == 0){
 			LOGGER("-->chunk completed!")
-			if (request->action != INJECT){
+			if (request->action != MODIFY_BODY_RESPONSE){
 				IF_GZERO(send_buffer(request->ssl, request->sock_browser, request->ssl_browser, const_char.endchunk, 5));
 			}
 			break;
 		}
-		if (request->action != INJECT){
+		if (request->action != MODIFY_BODY_RESPONSE){
 			request->body_response.written = 0;
 			if (request->body_response.size_block < size){
 				request->body_response.size_block = size;
@@ -1560,7 +1593,7 @@ bool get_chunk_data(pclient request)
 			request->body_response.written += comming;
 		}
 		IF_GZERO(input_buffer(request->ssl, request->sock_page, request->ssl_page, delimiter, 2))
-		if (request->action != INJECT){
+		if (request->action != MODIFY_BODY_RESPONSE){
 			IF_GZERO(send_buffer(request->ssl, request->sock_browser, request->ssl_browser, chunk_size, size_incomming))
 			IF_GZERO(send_buffer(request->ssl, request->sock_browser, request->ssl_browser, request->body_response.pointer, request->body_response.written))
 			IF_GZERO(send_buffer(request->ssl, request->sock_browser, request->ssl_browser, "\r\n", 2))
@@ -1572,7 +1605,8 @@ bool get_chunk_data(pclient request)
 
 bool get_body_response(pclient request)
 {
-	if (request->action != INJECT){
+	request->stage = BODY_RESPONSE;
+	if (request->action != MODIFY_BODY_RESPONSE){
 		IF_GZERO(send_buffer(request->ssl, request->sock_browser, request->ssl_browser, request->head_response.pointer, request->head_response.written))
 	}
 	if (request->headers_response.chunked == false && request->headers_response.content_length > 0){
@@ -1582,7 +1616,6 @@ bool get_body_response(pclient request)
 		LOGGER("-->chunk data method")
 		IF_GZERO(get_chunk_data(request))
 	}
-	request->stage = BODY_RESPONSE;
 	RETN_OK
 }
 
@@ -1593,9 +1626,19 @@ bool send_http_request(pclient request)
 
 bool send_new_response(pclient request)
 {
-	if (request->action == INJECT){
+	if (request->action == MODIFY_BODY_RESPONSE){
 		return send_request(request->ssl, request->sock_browser, request->ssl_browser, &request->head_response, &request->body_response);
 	}
+	RETN_OK
+}
+
+bool get_head_response(pclient request)
+{
+	request->stage = HEAD_RESPONSE;
+	IF_GZERO(get_headers_request(request->ssl, request->sock_page, request->ssl_page, &request->head_response))
+	sscanf(request->head_response.pointer, const_char.parse_response_code, &request->response_code);
+	parse_headers(&request->head_response, &request->headers_response);
+	apply_action(request);
 	RETN_OK
 }
 
@@ -1603,21 +1646,11 @@ bool get_http_request(pclient request)
 {
 	IF_GZERO(get_request(request))
 	IF_GZERO(get_info_request(request))
-	LOGGER("-->hostname %s, port %d, url %s, ssl %s, method %s, head size %d, body size %d", request->Head.hostname, request->Head.port, request->Head.url, HTTP_SSL[request->ssl], PROXY_METHODS[request->method], request->head_request.written, request->body_request.written)
+	LOGGER("-->hostname %s, port %d, url %s, ssl %s, method %s, head size %d, body size %d", request->info.hostname, request->info.port, request->info.url, HTTP_SSL[request->ssl], PROXY_METHODS[request->method], request->head_request.written, request->body_request.written)
 	check_action(request);
 	return (apply_action(request) == REJECT) ? false : true;
 }
 	
-bool set_socket_timeout(int socket)
-{
-	u_long timeout = proxy_config.timeout;
-
-	IF_ZERO(setsockopt(socket, SOL_SOCKET, SO_RCVTIMEO, (void*)&timeout, sizeof(u_long)))
-	timeout = proxy_config.timeout;
-	IF_ZERO(setsockopt(socket, SOL_SOCKET, SO_SNDTIMEO, (void*)&timeout, sizeof(u_long)))
-	RETN_OK
-}
-
 u_int socket_tunnel(pclient request)
 {
 	struct timeval timeout = {0};
@@ -1633,7 +1666,7 @@ u_int socket_tunnel(pclient request)
 		FD_ZERO(&rd_set);
 		FD_SET(request->sock_page, &rd_set);
 		FD_SET(request->sock_browser, &rd_set);
-		timeout.tv_sec = __TIMEOUT_IO_WS;
+		timeout.tv_sec = proxy_config.timeout_tunnel;
 		IF_GZERO(select(maxfd + 1, &rd_set, 0, 0, &timeout))
 		if(FD_ISSET(request->sock_page, &rd_set)) {
 			IF_GZERO(nread = input_buffer(request->ssl, request->sock_page, request->ssl_page, buffer, __INIT_SIZE_BUFFER))
@@ -1655,14 +1688,14 @@ bool handle_client(int client_socket)
 	request->sock_browser = (SOCKET)client_socket;
 	request->action = DIRECT;
 	request->thread_id = GetCurrentThreadId();
-	TRY_EXECUTION(set_socket_timeout(request->sock_browser))
+	TRY_EXECUTION(set_socket_timeout(request->sock_browser, proxy_config.timeout_tunnel))
 
 	keep_alive:
 		LOGGER("->request %d", request->nrequests)
 		TRY_EXECUTION(get_http_request(request))
 		if (!request->connection_established){
 			TRY_EXECUTION(socket_connection(request))
-			TRY_EXECUTION(set_socket_timeout(request->sock_page))
+			TRY_EXECUTION(set_socket_timeout(request->sock_page, proxy_config.timeout_tunnel))
 			#ifdef OPENSSL
 				if (request->ssl){
 					TRY_EXECUTION(load_ssl_files_pinning(request))
@@ -1849,6 +1882,16 @@ pdownload_content make_download_content_data(char* content_type)
 	return ndownload_content;
 }
 
+phead make_head_data(char* name, char* value)
+{
+	phead nhead = 0;
+
+	CHECK_ALLOC(head, calloc, nhead, 1)
+	strcpy(nhead->name, name);
+	nhead->value_length = strlen(name);
+	return nhead;
+}
+
 u_int get_size_file(char* path)
 {
 	WIN32_FILE_ATTRIBUTE_DATA fad = {0};
@@ -1860,53 +1903,32 @@ u_int get_size_file(char* path)
 	return size.QuadPart;
 }
 
-char* read_file(char* path)
-{
-	FILE* fd_file = 0;
-	char* buffer = 0;
-	int size = 0;
-	int readed = 0;
-	int incomming = 0;
-
-	IF_GZERO(fd_file = fopen(path, "r"))
-	IF_GZERO(size = get_size_file(path))
-	CHECK_ALLOC(char, calloc, buffer, size + 1)
-	while(readed != size){
-		incomming = fread(buffer + readed, sizeof(char), size - readed, fd_file);
-		if (incomming == 0) break;
-		else if(incomming == -1) return 0;
-		readed += incomming;
-	}
-	fclose(fd_file);
-	return buffer;
-}
-
-u_int get_rule_info(prule proxy_rule, char* rule_line)
+u_int get_rule_info(prule proxy_rule, char* config_line)
 {
 	u_int lentgh_action = 0;
 
-	if ((lentgh_action = strcspn(rule_line, DELIMITER_RULE_INFO)) >= 1){
-		if (strnstr(rule_line, lentgh_action, PROXY_ACTIONS[REDIRECT], 8)){
+	if ((lentgh_action = strcspn(config_line, DELIMITER_RULE_INFO)) >= 1){
+		if (strnstr(config_line, lentgh_action, PROXY_ACTIONS[REDIRECT], 8)){
 			proxy_rule->action = REDIRECT;
-		} else if (strnstr(rule_line, lentgh_action, PROXY_ACTIONS[CAPTURE], 7)){
+		} else if (strnstr(config_line, lentgh_action, PROXY_ACTIONS[CAPTURE], 7)){
 			proxy_rule->action = CAPTURE;
-		} else if (strnstr(rule_line, lentgh_action, PROXY_ACTIONS[INJECT], 6)){
-			proxy_rule->action = INJECT;
-		} else if (strnstr(rule_line, lentgh_action, PROXY_ACTIONS[SCREENSHOT], 10)){
+		} else if (strnstr(config_line, lentgh_action, PROXY_ACTIONS[MODIFY_BODY_RESPONSE], 6)){
+			proxy_rule->action = MODIFY_BODY_RESPONSE;
+		} else if (strnstr(config_line, lentgh_action, PROXY_ACTIONS[SCREENSHOT], 10)){
 			proxy_rule->action = SCREENSHOT;
-		} else if (strnstr(rule_line, lentgh_action, PROXY_ACTIONS[FAKE_TLS_EXT_HOSTNAME], 21)){
+		} else if (strnstr(config_line, lentgh_action, PROXY_ACTIONS[FAKE_TLS_EXT_HOSTNAME], 21)){
 			proxy_rule->action = FAKE_TLS_EXT_HOSTNAME;
-		} else if (strnstr(rule_line, lentgh_action, PROXY_ACTIONS[REMOVE_HEADER_REQUEST], 21)){
+		} else if (strnstr(config_line, lentgh_action, PROXY_ACTIONS[REMOVE_HEADER_REQUEST], 21)){
 			proxy_rule->action = REMOVE_HEADER_REQUEST;
-		} else if (strnstr(rule_line, lentgh_action, PROXY_ACTIONS[REMOVE_HEADER_RESPONSE], 22)){
+		} else if (strnstr(config_line, lentgh_action, PROXY_ACTIONS[REMOVE_HEADER_RESPONSE], 22)){
 			proxy_rule->action = REMOVE_HEADER_RESPONSE;
-		} else if (strnstr(rule_line, lentgh_action, PROXY_ACTIONS[DOWNLOAD_CONTENT], 16)){
+		} else if (strnstr(config_line, lentgh_action, PROXY_ACTIONS[DOWNLOAD_CONTENT], 16)){
 			proxy_rule->action = DOWNLOAD_CONTENT;
-		} else if (strnstr(rule_line, lentgh_action, PROXY_ACTIONS[REJECT], 6)){
+		} else if (strnstr(config_line, lentgh_action, PROXY_ACTIONS[REJECT], 6)){
 			proxy_rule->action = REJECT;
 		}
 		lentgh_action++;
-		IF_GZERO(get_method(rule_line + lentgh_action, &proxy_rule->method));
+		IF_GZERO(get_method(config_line + lentgh_action, &proxy_rule->method));
 	}
 	if(proxy_rule->action == DIRECT || UNKNOW == proxy_rule->method){
 		RETN_FAIL
@@ -1914,92 +1936,126 @@ u_int get_rule_info(prule proxy_rule, char* rule_line)
 	RETN_OK
 }
 
-bool load_proxy_rules(char* buffer)
+bool load_proxy_rules()
 {
 	prule proxy_rule = 0;
-	char* rule_line = 0;
-	char* backup = 0;
+	FILE* config_file = 0;
+	char config_line[2048] = {0};
 	char arg_1[MAX_ARG_1_SIZE] = {0};
 	char arg_2[MAX_ARG_2_SIZE] = {0};
 	u_int arg_3 = 0;
 	u_int line = 1;
 
-	LOGGER("-->parsing rules...")
-	if(!buffer){
-		LOGGER("-->rules not found!")
-		RETN_FAIL
-	}
-	rule_line = strtok_r(buffer, DELIMITER_RULE, &backup);
-	while (rule_line){
-		if (*rule_line != COMMENT_RULE){
-			CHECK_ALLOC(rule, calloc, proxy_rule, 1)
-			TRY_EXECUTION(get_rule_info(proxy_rule, rule_line));
-			switch (proxy_rule->action){
-				case INJECT:
-					if (sscanf(rule_line, "%*[^" DELIMITER_RULE_INFO "]" DELIMITER_RULE_INFO "%*[^" DELIMITER_RULE_INFO "]" DELIMITER_RULE_INFO "%" IN2STR(MAX_URL_SIZE) "[^" DELIMITER_RULE_INFO "]" DELIMITER_RULE_INFO "%" IN2STR(MAX_ARG_1_SIZE) "[^" DELIMITER_RULE_INFO "]" DELIMITER_RULE_INFO "%" IN2STR(MAX_ARG_2_SIZE) "s", proxy_rule->url, arg_1, arg_2) != 3){
+	LOGGER("-->loading configuration...")
+	if((config_file = fopen(__CONFIG_FILE, "r"))){
+		while(fgets(config_line, 2048, config_file)){
+			if (*config_line != COMMENT_RULE){
+				if(sscanf(config_line, SETTING_FORMAT, arg_1, arg_2) == 2){
+					if(!strcmp(arg_1, KEY_SETTING[_INTERFACE])){
+						strcpy(proxy_config._interface, arg_2);
+					} else if(!strcmp(arg_1, KEY_SETTING[PORT])){
+						proxy_config.port = atoi(arg_2);
+					} else if(!strcmp(arg_1, KEY_SETTING[POOL_NTHREADS])){
+						proxy_config.nthreads = atoi(arg_2);
+					} else if(!strcmp(arg_1, KEY_SETTING[TIMEOUT_CONNECT])){
+						proxy_config.timeout_connect = atoi(arg_2) * 1000;
+					} else if(!strcmp(arg_1, KEY_SETTING[TIMEOUT_TUNNEL])){
+						proxy_config.timeout_tunnel = atoi(arg_2) * 1000;
+					} else if(!strcmp(arg_1, KEY_SETTING[INIT_BUFFER_SIZE])){
+						proxy_config.init_buffer_size = atoi(arg_2);
+					} else {
 						goto __exception;
 					}
-					break;
-				case REDIRECT:
-					if (sscanf(rule_line, "%*[^" DELIMITER_RULE_INFO "]" DELIMITER_RULE_INFO "%*[^" DELIMITER_RULE_INFO "]" DELIMITER_RULE_INFO "%" IN2STR(MAX_URL_SIZE) "[^" DELIMITER_RULE_INFO "]" DELIMITER_RULE_INFO "%" IN2STR(MAX_ARG_1_SIZE) "[^" DELIMITER_RULE_INFO "]" DELIMITER_RULE_INFO "%d", proxy_rule->url, arg_1, &arg_3) != 3){
-						goto __exception;
-					}
-					break;
-				case REMOVE_HEADER_REQUEST:
-				case REMOVE_HEADER_RESPONSE:
-				case FAKE_TLS_EXT_HOSTNAME:
-				case DOWNLOAD_CONTENT:
-					if (sscanf(rule_line, "%*[^" DELIMITER_RULE_INFO "]" DELIMITER_RULE_INFO "%*[^" DELIMITER_RULE_INFO "]" DELIMITER_RULE_INFO "%" IN2STR(MAX_URL_SIZE) "[^" DELIMITER_RULE_INFO "]" DELIMITER_RULE_INFO "%" IN2STR(MAX_ARG_1_SIZE) "s", proxy_rule->url, arg_1) != 2){
-						goto __exception;
-					}
-					break;
-				case SCREENSHOT:
-				case CAPTURE:
-				case REJECT:
-				default:
-					if (sscanf(rule_line, "%*[^" DELIMITER_RULE_INFO "]" DELIMITER_RULE_INFO "%*[^" DELIMITER_RULE_INFO "]" DELIMITER_RULE_INFO "%" IN2STR(MAX_URL_SIZE) "s", proxy_rule->url) != 1){
-						goto __exception;
-					}
-					break;
-			}
-			if (parse_url(proxy_rule)){
-				if (proxy_rule->action == INJECT){
-					proxy_rule->extra_data = make_inject_data(arg_1, arg_2);
-				} else if (proxy_rule->action == REDIRECT){
-					proxy_rule->extra_data = make_redirect_data(arg_1, arg_3);
-				} else if (proxy_rule->action == FAKE_TLS_EXT_HOSTNAME){
-					proxy_rule->extra_data = make_fake_tls_ext_hostname_data(arg_1);
-				} else if (proxy_rule->action == DOWNLOAD_CONTENT){
-					proxy_rule->extra_data = make_download_content_data(arg_1);
+					continue;
 				}
-				ADD_RULE(proxy_rule);
-			} else {
-				goto __exception;
+				CHECK_ALLOC(rule, calloc, proxy_rule, 1)
+				TRY_EXECUTION(get_rule_info(proxy_rule, config_line));
+				switch (proxy_rule->action){
+					case MODIFY_BODY_RESPONSE:
+						if (sscanf(config_line, "%*[^" DELIMITER_RULE_INFO "]" DELIMITER_RULE_INFO "%*[^" DELIMITER_RULE_INFO "]" DELIMITER_RULE_INFO "%" IN2STR(MAX_URL_SIZE) "[^" DELIMITER_RULE_INFO "]" DELIMITER_RULE_INFO "%" IN2STR(MAX_ARG_1_SIZE) "[^" DELIMITER_RULE_INFO "]" DELIMITER_RULE_INFO "%" IN2STR(MAX_ARG_2_SIZE) "s", proxy_rule->url, arg_1, arg_2) != 3){
+							goto __exception;
+						}
+						break;
+					case REDIRECT:
+						if (sscanf(config_line, "%*[^" DELIMITER_RULE_INFO "]" DELIMITER_RULE_INFO "%*[^" DELIMITER_RULE_INFO "]" DELIMITER_RULE_INFO "%" IN2STR(MAX_URL_SIZE) "[^" DELIMITER_RULE_INFO "]" DELIMITER_RULE_INFO "%" IN2STR(MAX_ARG_1_SIZE) "[^" DELIMITER_RULE_INFO "]" DELIMITER_RULE_INFO "%d", proxy_rule->url, arg_1, &arg_3) != 3){
+							goto __exception;
+						}
+						break;
+					case REMOVE_HEADER_REQUEST:
+					case REMOVE_HEADER_RESPONSE:
+					case FAKE_TLS_EXT_HOSTNAME:
+					case DOWNLOAD_CONTENT:
+						if (sscanf(config_line, "%*[^" DELIMITER_RULE_INFO "]" DELIMITER_RULE_INFO "%*[^" DELIMITER_RULE_INFO "]" DELIMITER_RULE_INFO "%" IN2STR(MAX_URL_SIZE) "[^" DELIMITER_RULE_INFO "]" DELIMITER_RULE_INFO "%" IN2STR(MAX_ARG_1_SIZE) "s", proxy_rule->url, arg_1) != 2){
+							goto __exception;
+						}
+						break;
+					case SCREENSHOT:
+					case CAPTURE:
+					case REJECT:
+					default:
+						if (sscanf(config_line, "%*[^" DELIMITER_RULE_INFO "]" DELIMITER_RULE_INFO "%*[^" DELIMITER_RULE_INFO "]" DELIMITER_RULE_INFO "%" IN2STR(MAX_URL_SIZE) "s", proxy_rule->url) != 1){
+							goto __exception;
+						}
+						break;
+				}
+				if (parse_url(proxy_rule)){
+					if (proxy_rule->action == MODIFY_BODY_RESPONSE){
+						proxy_rule->extra_data = make_inject_data(arg_1, arg_2);
+					} else if (proxy_rule->action == REDIRECT){
+						proxy_rule->extra_data = make_redirect_data(arg_1, arg_3);
+					} else if (proxy_rule->action == FAKE_TLS_EXT_HOSTNAME){
+						proxy_rule->extra_data = make_fake_tls_ext_hostname_data(arg_1);
+					} else if (proxy_rule->action == DOWNLOAD_CONTENT){
+						proxy_rule->extra_data = make_download_content_data(arg_1);
+					} else if (proxy_rule->action == REMOVE_HEADER_RESPONSE || REMOVE_HEADER_REQUEST == proxy_rule->action){
+						proxy_rule->extra_data = make_head_data(arg_1, arg_2);
+					}
+					ADD_RULE(proxy_rule);
+				} else {
+					goto __exception;
+				}
 			}
-		}
-		rule_line = strtok_r(0, DELIMITER_RULE, &backup);
 		line++;
+		}
+	} else {
+		LOGGER("-->h2Polar '%s' configuration file not was found.", __CONFIG_FILE)
+		goto __exception;
 	}
+	fclose(config_file);
 	#ifdef DEBUG
 		int count = 0;
+		LOGGER("-->interface %s port %d nthreads %d timeout-connect %lu timeout-tunnel %lu init-buffer-size %d max-clients %d", proxy_config._interface, proxy_config.port, proxy_config.nthreads, 
+																															   proxy_config.timeout_connect, proxy_config.timeout_tunnel, proxy_config.init_buffer_size, __MAX_CLIENT)
+		LOGGER("-->set your http/s client with http://%s:%d%s pac url.", proxy_config._interface, proxy_config.port, __PAC_FILE)
 		LOGGER("-->rules loaded:")
 		ITER_LLIST(proxy_rule, proxy_config.proxy_rules){
 			count++;
 			switch (proxy_rule->action){
-				case INJECT:
-					LOGGER("(#%d)[INJECT] [%s] [%s] [%d] [%s] [%s] [%s] [%s]", 
-							count, PROXY_METHODS[proxy_rule->method], HTTP_SSL[proxy_rule->ssl], proxy_rule->port, proxy_rule->domain, proxy_rule->url, ((pinjection)proxy_rule->extra_data)->prefix, ((pinjection)proxy_rule->extra_data)->inject)
+				case MODIFY_BODY_RESPONSE:
+					LOGGER("(#%d)[MODIFY_BODY_RESPONSE] [%s] [%s] [%d] [%s] [%s] [%s] [%s]", 
+							count, PROXY_METHODS[proxy_rule->method], HTTP_SSL[proxy_rule->ssl], proxy_rule->port, proxy_rule->domain, proxy_rule->url, 
+							((pinjection)proxy_rule->extra_data)->prefix, ((pinjection)proxy_rule->extra_data)->inject)
 					break;
 				case REDIRECT:
 					LOGGER("(#%d)[REDIRECT] [%s] [%s] [%d] [%s] [%s] [%s] [%d]", 
-							count, PROXY_METHODS[proxy_rule->method], HTTP_SSL[proxy_rule->ssl], proxy_rule->port, proxy_rule->domain, proxy_rule->url, ((predirect)proxy_rule->extra_data)->hostname, ((predirect)proxy_rule->extra_data)->port)
+							count, PROXY_METHODS[proxy_rule->method], HTTP_SSL[proxy_rule->ssl], proxy_rule->port, proxy_rule->domain, proxy_rule->url, 
+							((predirect)proxy_rule->extra_data)->hostname, ((predirect)proxy_rule->extra_data)->port)
 					break;
 				case REMOVE_HEADER_REQUEST:
 				case REMOVE_HEADER_RESPONSE:
+					LOGGER("(#%d)[%s] [%s] [%s] [%d] [%s] [%s] [%s]", 
+							count, PROXY_ACTIONS[proxy_rule->action], PROXY_METHODS[proxy_rule->method], HTTP_SSL[proxy_rule->ssl], proxy_rule->port, proxy_rule->domain, proxy_rule->url, 
+							((phead)proxy_rule->extra_data)->name)
+					break;
 				case FAKE_TLS_EXT_HOSTNAME:
+					LOGGER("(#%d)[%s] [%s] [%s] [%d] [%s] [%s] [%s]", 
+							count, PROXY_ACTIONS[proxy_rule->action], PROXY_METHODS[proxy_rule->method], HTTP_SSL[proxy_rule->ssl], proxy_rule->port, proxy_rule->domain, proxy_rule->url, 
+							((pfake_tls_ext_hostname)proxy_rule->extra_data)->hostname)
+					break;
 				case DOWNLOAD_CONTENT:
 					LOGGER("(#%d)[%s] [%s] [%s] [%d] [%s] [%s] [%s]", 
-							count, PROXY_ACTIONS[proxy_rule->action], PROXY_METHODS[proxy_rule->method], HTTP_SSL[proxy_rule->ssl], proxy_rule->port, proxy_rule->domain, proxy_rule->url, ((pdownload_content)proxy_rule->extra_data)->content_type)
+							count, PROXY_ACTIONS[proxy_rule->action], PROXY_METHODS[proxy_rule->method], HTTP_SSL[proxy_rule->ssl], proxy_rule->port, proxy_rule->domain, proxy_rule->url, 
+							((pdownload_content)proxy_rule->extra_data)->content_type)
 					break;
 				case SCREENSHOT:
 				case CAPTURE:
@@ -2014,10 +2070,9 @@ bool load_proxy_rules(char* buffer)
 		LOGGER("")
 	#endif
 	generate_pac_response();
-	proxy_config.timeout = (u_long)__TIMEOUT_IO;
 	RETN_OK
 	__exception:
-		LOGGER("->it was a error parsing the settings, line: %d, string: (%s)", line, rule_line)
+		LOGGER("->it was a error parsing the settings, line: %d, string: (%s)", line, config_line)
 		RETN_FAIL
 }
 
@@ -2027,24 +2082,22 @@ bool start_http_proxy()
 	struct sockaddr_in proxy_addr = {0};
 	WSADATA wsd = {0};
 	int dummy_struct_size = 0;
-	int opt_reuse = 0;
+	int opt_reuse = 1;
 	SOCKET client_socket = 0;
 	pthread_pool pool = 0;
 
 	dummy_struct_size = sizeof(proxy_addr);
 	proxy_addr.sin_family = 2;
-	proxy_addr.sin_port = htons(__PORT_BIND);
-	proxy_addr.sin_addr.s_addr = inet_addr(__INTERFACE_BIND);
-	opt_reuse = 1;
-	proxy_config.proxy_state = true;
+	proxy_addr.sin_port = htons(proxy_config.port);
+	proxy_addr.sin_addr.s_addr = inet_addr(proxy_config._interface);
 
-	IF_ZERO(WSAStartup(MAKEWORD(2, 2), &wsd))
+	TRY_EXECUTION(!WSAStartup(MAKEWORD(2, 2), &wsd))
 	IF_GZERO(proxy_config.socket = socket(2, 1, 0))
-	IF_ZERO(setsockopt(proxy_config.socket, SOL_SOCKET, SO_REUSEADDR, (char*)&opt_reuse, sizeof(int)))
-	IF_ZERO(bind(proxy_config.socket, (struct sockaddr*)&proxy_addr, sizeof(proxy_addr)))
-	IF_ZERO(listen(proxy_config.socket, __MAX_CLIENT))
+	TRY_EXECUTION(!setsockopt(proxy_config.socket, SOL_SOCKET, SO_REUSEADDR, (char*)&opt_reuse, sizeof(int)))
+	TRY_EXECUTION(!bind(proxy_config.socket, (struct sockaddr*)&proxy_addr, sizeof(proxy_addr)))
+	TRY_EXECUTION(!listen(proxy_config.socket, __MAX_CLIENT))
 	#ifdef THREAD_POOL
-		IF_GZERO(create_thread_pool(&pool, __POOL_NTHREAD))
+		IF_GZERO(create_thread_pool(&pool, proxy_config.nthreads))
 	#endif
 	#ifdef OPENSSL
 		SSLeay_add_ssl_algorithms();
@@ -2052,8 +2105,7 @@ bool start_http_proxy()
 			generate_ssl_files();
 		}
 	#endif
-
-	for (;proxy_config.proxy_state;){
+	while (true){
 		client_socket = accept(proxy_config.socket, (struct sockaddr*)&client_addr, &dummy_struct_size);
 		#ifdef THREAD_POOL
 			add_pool_job(pool, client_socket);
@@ -2061,6 +2113,8 @@ bool start_http_proxy()
 			CloseHandle(CreateThread(0, 0, (LPTHREAD_START_ROUTINE)handle_client, (void*)client_socket, 0, 0));
 		#endif
 	}
+	__exception:
+		LOGGER("->it was a error starting proxy, error (%lu).", GetLastError())
 	RETN_OK
 }
 
@@ -2074,10 +2128,8 @@ int main(int argc, char** argv)
 		InitializeCriticalSection(&proxy_config.stdout_lock);
 	#endif
 	LOGGER("->h2Polar by %s V:%s", __AUTHOR, __VERSION)
-	LOGGER("->listening in %s:%d, buffer size %d, timeout %d, timeout ws %d, nthread %d, max clients %d", __INTERFACE_BIND, __PORT_BIND, __INIT_SIZE_BUFFER, __TIMEOUT_IO, __TIMEOUT_IO_WS, __POOL_NTHREAD, __MAX_CLIENT)
-	LOGGER("->set your client proxy pac with http://%s:%d%s", __INTERFACE_BIND, __PORT_BIND, __PAC_FILE)
 	load_strings();
-	IF_GZERO(load_proxy_rules(read_file(__RULES_FILE)))
+	IF_GZERO(load_proxy_rules())
 	start_http_proxy();
 	RETN_OK
 }
