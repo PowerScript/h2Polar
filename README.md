@@ -21,6 +21,7 @@ only windows is support for now.
 ## traffic features
 * CAPTURE - log traffic
 * MODIFY_BODY_RESPONSE - modified body traffic
+* ADD_HEADER_REQUEST - add headers in request
 * REMOVE_HEADER_REQUEST - remove headers in request
 * REMOVE_HEADER_RESPONSE - remove headers in response
 * DOWNLOAD_CONTENT - download content (videos, images, music)
