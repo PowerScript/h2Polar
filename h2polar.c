@@ -46,7 +46,7 @@
 	#define __POOL_NTHREAD              20
 #endif
 #define __AUTHOR                        "RedToor"
-#define __VERSION                       "2021.11.21.1437"
+#define __VERSION                       "2022.01.20.2037"
 #define __CAPTURE_FILE                  "h2Polar.log"
 #define __DOWNLOAD_FOLDER               "%s"
 #define __CONFIG_FILE                    "h2polar.cfg"
@@ -136,6 +136,7 @@ typedef enum {
 	FAKE_TLS_EXT_HOSTNAME,
 	REMOVE_HEADER_REQUEST,
 	REMOVE_HEADER_RESPONSE,
+	ADD_HEADER_REQUEST,
 	DOWNLOAD_CONTENT
 } PROXY_ACTION;
 
@@ -199,10 +200,8 @@ typedef struct
 
 typedef struct 
 {
-	char name[24];
-	char value[1024];
-	u_int name_length;
-	u_int value_length;
+	char header[2048];
+	u_int header_length;
 } head, *phead;
 
 typedef struct _rule {
@@ -275,6 +274,7 @@ struct {
 	u_long timeout_connect;
 	u_long timeout_tunnel;
 	u_int init_buffer_size;
+	char* cfg_file;
 	#ifdef OPENSSL
 		X509* certificate;
 		EVP_PKEY* client_key;
@@ -339,7 +339,7 @@ struct {
 char* PROXY_ACTIONS[] = { [DIRECT] = "DIRECT", [CAPTURE] = "CAPTURE", [MODIFY_BODY_RESPONSE] = "MODIFY_BODY_RESPONSE", [REDIRECT] = "REDIRECT", 
 						  [REJECT] = "REJECT", [SCREENSHOT] = "SCREENSHOT", [FAKE_TLS_EXT_HOSTNAME] = "FAKE_TLS_EXT_HOSTNAME", 
 						  [REMOVE_HEADER_REQUEST] = "REMOVE_HEADER_REQUEST", [REMOVE_HEADER_RESPONSE] = "REMOVE_HEADER_RESPONSE",
-						  [DOWNLOAD_CONTENT] = "DOWNLOAD_CONTENT" };
+						  [ADD_HEADER_REQUEST] = "ADD_HEADER_REQUEST", [DOWNLOAD_CONTENT] = "DOWNLOAD_CONTENT" };
 char* PROXY_METHODS[] = { [UNKNOW] = "UNKNOW", [ALL] = "ALL", [CONNECT] = "CONNECT", [GET] = "GET", [PUT] = "PUT", [POST] = "POST", [HEAD] = "HEAD", [DELETE_] = "DELETE" };
 char* KEY_SETTING[] = {   [_INTERFACE] = "INTERFACE", [PORT] = "PORT", [POOL_NTHREADS] = "POOL_NTHREADS", [TIMEOUT_CONNECT] = "TIMEOUT_CONNECT",
 						  [TIMEOUT_TUNNEL] = "TIMEOUT_TUNNEL", [INIT_BUFFER_SIZE] = "INIT_BUFFER_SIZE" };
@@ -381,6 +381,7 @@ void load_strings()
 	proxy_config.timeout_connect = __TIMEOUT_CONNECT;
 	proxy_config.timeout_tunnel = __TIMEOUT_TUNNEL;
 	proxy_config.init_buffer_size = __INIT_SIZE_BUFFER;
+	proxy_config.cfg_file = __CONFIG_FILE;
 	const_char.http_get = "GET";
 	const_char.http_post = "POST";
 	const_char.http_connect = "CONNECT";
@@ -983,6 +984,23 @@ bool send_buffer(bool is_ssl, int socket, pssl_layer ssl, char* buffer, u_int si
 	RETN_OK
 }
 
+bool add_http_header(pbuffer head_buffer, char* header, u_int header_length)
+{
+	u_int fix_length = head_buffer->written + header_length;
+
+	IF_GZERO(head_buffer->pointer)
+	if(fix_length > head_buffer->size_block){
+		head_buffer->size_block = fix_length;
+		CHECK_REALLOC(char, realloc, head_buffer->pointer, head_buffer->pointer, head_buffer->size_block)
+	}
+	head_buffer->written = head_buffer->written - 2;
+	memcpy(head_buffer->pointer + head_buffer->written, header, header_length);
+	head_buffer->written += header_length;
+	memcpy(head_buffer->pointer + head_buffer->written, "\r\n\r\n", 4);
+	head_buffer->written += 4;
+	RETN_OK
+}
+
 bool remove_http_header(pbuffer head_buffer, char* headname)
 {
 	char* offset_header = 0;
@@ -1449,11 +1467,14 @@ bool apply_download_content(pclient request, pdownload_content download_content)
 void apply_header_actions(pclient request, PROXY_ACTION action, phead header)
 {
 	if (action == REMOVE_HEADER_REQUEST && BODY_REQUEST == request->stage){
-		LOGGER("----->removing header request: %s", header->name);
-		remove_http_header(&request->head_request, header->name);
+		LOGGER("----->removing header request: %s", header->header);
+		remove_http_header(&request->head_request, header->header);
 	} else if (action == REMOVE_HEADER_RESPONSE && HEAD_RESPONSE == request->stage){
-		LOGGER("----->removing header response: %s", header->name);
-		remove_http_header(&request->head_response, header->name);
+		LOGGER("----->removing header response: %s", header->header);
+		remove_http_header(&request->head_response, header->header);
+	} else if (action == ADD_HEADER_REQUEST && BODY_REQUEST == request->stage){
+		LOGGER("----->adding header request: %s", header->header);
+		add_http_header(&request->head_request, header->header, header->header_length);
 	}
 }
 
@@ -1486,6 +1507,7 @@ int apply_action(pclient request)
 				break;
 			case REMOVE_HEADER_REQUEST:
 			case REMOVE_HEADER_RESPONSE:
+			case ADD_HEADER_REQUEST:
 				apply_header_actions(request, config->action, ((phead)config->extra_data));
 				break;
 			case DOWNLOAD_CONTENT:
@@ -1527,7 +1549,7 @@ bool check_action(pclient request)
 			} else if (naction->action == DOWNLOAD_CONTENT){
 				CHECK_ALLOC(download_content, calloc, naction->extra_data, 1)
 				memcpy(naction->extra_data, proxy_rule->extra_data, sizeof(download_content));
-			} else if (naction->action == REMOVE_HEADER_RESPONSE || REMOVE_HEADER_REQUEST == naction->action){
+			} else if (naction->action == REMOVE_HEADER_RESPONSE || REMOVE_HEADER_REQUEST == naction->action || naction->action == ADD_HEADER_REQUEST){
 				CHECK_ALLOC(head, calloc, naction->extra_data, 1)
 				memcpy(naction->extra_data, proxy_rule->extra_data, sizeof(head));
 			}
@@ -1882,13 +1904,13 @@ pdownload_content make_download_content_data(char* content_type)
 	return ndownload_content;
 }
 
-phead make_head_data(char* name, char* value)
+phead make_head_data(char* header)
 {
 	phead nhead = 0;
 
 	CHECK_ALLOC(head, calloc, nhead, 1)
-	strcpy(nhead->name, name);
-	nhead->value_length = strlen(name);
+	strcpy(nhead->header, header);
+	nhead->header_length = strlen(header);
 	return nhead;
 }
 
@@ -1922,6 +1944,8 @@ u_int get_rule_info(prule proxy_rule, char* config_line)
 			proxy_rule->action = REMOVE_HEADER_REQUEST;
 		} else if (strnstr(config_line, lentgh_action, PROXY_ACTIONS[REMOVE_HEADER_RESPONSE], 22)){
 			proxy_rule->action = REMOVE_HEADER_RESPONSE;
+		} else if (strnstr(config_line, lentgh_action, PROXY_ACTIONS[ADD_HEADER_REQUEST], 18)){
+			proxy_rule->action = ADD_HEADER_REQUEST;
 		} else if (strnstr(config_line, lentgh_action, PROXY_ACTIONS[DOWNLOAD_CONTENT], 16)){
 			proxy_rule->action = DOWNLOAD_CONTENT;
 		} else if (strnstr(config_line, lentgh_action, PROXY_ACTIONS[REJECT], 6)){
@@ -1946,10 +1970,10 @@ bool load_proxy_rules()
 	u_int arg_3 = 0;
 	u_int line = 1;
 
-	LOGGER("-->loading configuration...")
-	if((config_file = fopen(__CONFIG_FILE, "r"))){
+	LOGGER("-->loading configuration: %s...", proxy_config.cfg_file)
+	if((config_file = fopen(proxy_config.cfg_file, "r"))){
 		while(fgets(config_line, 2048, config_file)){
-			if (*config_line != COMMENT_RULE){
+			if (COMMENT_RULE != *config_line && *config_line != '\n'){
 				if(sscanf(config_line, SETTING_FORMAT, arg_1, arg_2) == 2){
 					if(!strcmp(arg_1, KEY_SETTING[_INTERFACE])){
 						strcpy(proxy_config._interface, arg_2);
@@ -1972,7 +1996,7 @@ bool load_proxy_rules()
 				TRY_EXECUTION(get_rule_info(proxy_rule, config_line));
 				switch (proxy_rule->action){
 					case MODIFY_BODY_RESPONSE:
-						if (sscanf(config_line, "%*[^" DELIMITER_RULE_INFO "]" DELIMITER_RULE_INFO "%*[^" DELIMITER_RULE_INFO "]" DELIMITER_RULE_INFO "%" IN2STR(MAX_URL_SIZE) "[^" DELIMITER_RULE_INFO "]" DELIMITER_RULE_INFO "%" IN2STR(MAX_ARG_1_SIZE) "[^" DELIMITER_RULE_INFO "]" DELIMITER_RULE_INFO "%" IN2STR(MAX_ARG_2_SIZE) "s", proxy_rule->url, arg_1, arg_2) != 3){
+						if (sscanf(config_line, "%*[^" DELIMITER_RULE_INFO "]" DELIMITER_RULE_INFO "%*[^" DELIMITER_RULE_INFO "]" DELIMITER_RULE_INFO "%" IN2STR(MAX_URL_SIZE) "[^" DELIMITER_RULE_INFO "]" DELIMITER_RULE_INFO "%" IN2STR(MAX_ARG_1_SIZE) "[^" DELIMITER_RULE_INFO "]" DELIMITER_RULE_INFO "%" IN2STR(MAX_ARG_2_SIZE) "[^\n]\n", proxy_rule->url, arg_1, arg_2) != 3){
 							goto __exception;
 						}
 						break;
@@ -1983,9 +2007,10 @@ bool load_proxy_rules()
 						break;
 					case REMOVE_HEADER_REQUEST:
 					case REMOVE_HEADER_RESPONSE:
+					case ADD_HEADER_REQUEST:
 					case FAKE_TLS_EXT_HOSTNAME:
 					case DOWNLOAD_CONTENT:
-						if (sscanf(config_line, "%*[^" DELIMITER_RULE_INFO "]" DELIMITER_RULE_INFO "%*[^" DELIMITER_RULE_INFO "]" DELIMITER_RULE_INFO "%" IN2STR(MAX_URL_SIZE) "[^" DELIMITER_RULE_INFO "]" DELIMITER_RULE_INFO "%" IN2STR(MAX_ARG_1_SIZE) "s", proxy_rule->url, arg_1) != 2){
+						if (sscanf(config_line, "%*[^" DELIMITER_RULE_INFO "]" DELIMITER_RULE_INFO "%*[^" DELIMITER_RULE_INFO "]" DELIMITER_RULE_INFO "%" IN2STR(MAX_URL_SIZE) "[^" DELIMITER_RULE_INFO "]" DELIMITER_RULE_INFO "%" IN2STR(MAX_ARG_1_SIZE) "[^\n]\n", proxy_rule->url, arg_1) != 2){
 							goto __exception;
 						}
 						break;
@@ -1993,7 +2018,7 @@ bool load_proxy_rules()
 					case CAPTURE:
 					case REJECT:
 					default:
-						if (sscanf(config_line, "%*[^" DELIMITER_RULE_INFO "]" DELIMITER_RULE_INFO "%*[^" DELIMITER_RULE_INFO "]" DELIMITER_RULE_INFO "%" IN2STR(MAX_URL_SIZE) "s", proxy_rule->url) != 1){
+						if (sscanf(config_line, "%*[^" DELIMITER_RULE_INFO "]" DELIMITER_RULE_INFO "%*[^" DELIMITER_RULE_INFO "]" DELIMITER_RULE_INFO "%" IN2STR(MAX_URL_SIZE) "[^\n]\n", proxy_rule->url) != 1){
 							goto __exception;
 						}
 						break;
@@ -2007,8 +2032,8 @@ bool load_proxy_rules()
 						proxy_rule->extra_data = make_fake_tls_ext_hostname_data(arg_1);
 					} else if (proxy_rule->action == DOWNLOAD_CONTENT){
 						proxy_rule->extra_data = make_download_content_data(arg_1);
-					} else if (proxy_rule->action == REMOVE_HEADER_RESPONSE || REMOVE_HEADER_REQUEST == proxy_rule->action){
-						proxy_rule->extra_data = make_head_data(arg_1, arg_2);
+					} else if (proxy_rule->action == REMOVE_HEADER_RESPONSE || REMOVE_HEADER_REQUEST == proxy_rule->action || proxy_rule->action == ADD_HEADER_REQUEST){
+						proxy_rule->extra_data = make_head_data(arg_1);
 					}
 					ADD_RULE(proxy_rule);
 				} else {
@@ -2043,9 +2068,10 @@ bool load_proxy_rules()
 					break;
 				case REMOVE_HEADER_REQUEST:
 				case REMOVE_HEADER_RESPONSE:
+				case ADD_HEADER_REQUEST:
 					LOGGER("(#%d)[%s] [%s] [%s] [%d] [%s] [%s] [%s]", 
 							count, PROXY_ACTIONS[proxy_rule->action], PROXY_METHODS[proxy_rule->method], HTTP_SSL[proxy_rule->ssl], proxy_rule->port, proxy_rule->domain, proxy_rule->url, 
-							((phead)proxy_rule->extra_data)->name)
+							((phead)proxy_rule->extra_data)->header)
 					break;
 				case FAKE_TLS_EXT_HOSTNAME:
 					LOGGER("(#%d)[%s] [%s] [%s] [%d] [%s] [%s] [%s]", 
@@ -2084,7 +2110,9 @@ bool start_http_proxy()
 	int dummy_struct_size = 0;
 	int opt_reuse = 1;
 	SOCKET client_socket = 0;
-	pthread_pool pool = 0;
+	#ifdef THREAD_POOL
+		pthread_pool pool = 0;
+	#endif
 
 	dummy_struct_size = sizeof(proxy_addr);
 	proxy_addr.sin_family = 2;
@@ -2129,6 +2157,9 @@ int main(int argc, char** argv)
 	#endif
 	LOGGER("->h2Polar by %s V:%s", __AUTHOR, __VERSION)
 	load_strings();
+	if(argc == 2){
+		proxy_config.cfg_file = argv[1];
+	}
 	IF_GZERO(load_proxy_rules())
 	start_http_proxy();
 	RETN_OK
