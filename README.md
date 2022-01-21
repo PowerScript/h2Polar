@@ -20,14 +20,14 @@ only windows is support for now.
 
 ## traffic features
 * CAPTURE - log traffic
-* MODIFY_BODY_RESPONSE - modified body traffic
-* ADD_HEADER_REQUEST - add headers in request
-* REMOVE_HEADER_REQUEST - remove headers in request
-* REMOVE_HEADER_RESPONSE - remove headers in response
-* DOWNLOAD_CONTENT - download content (videos, images, music)
-* SCREENSHOT - take a screenshot when you want
-* FAKE_TLS_EXT_HOSTNAME - bypass firewalls
-* REDIRECT - redirect domains
+* [MODIFY_BODY_RESPONSE](https://github.com/PowerScript/h2Polar/blob/main/h2polar.cfg#L47) - modified body traffic
+* [ADD_HEADER_REQUEST](https://github.com/PowerScript/h2Polar/blob/main/h2polar.cfg#L79) - add headers in request
+* [REMOVE_HEADER_REQUEST](https://github.com/PowerScript/h2Polar/blob/main/h2polar.cfg#L73) - remove headers in request
+* [REMOVE_HEADER_RESPONSE](https://github.com/PowerScript/h2Polar/blob/main/h2polar.cfg#L57) - remove headers in response
+* [DOWNLOAD_CONTENT](https://github.com/PowerScript/h2Polar/blob/main/h2polar.cfg#L69) - download content (videos, images, music)
+* [SCREENSHOT](https://github.com/PowerScript/h2Polar/blob/main/h2polar.cfg#L53) - take a screenshot when you want
+* [FAKE_TLS_EXT_HOSTNAME](https://github.com/PowerScript/h2Polar/blob/main/h2polar.cfg#L61) - bypass firewalls
+* [REDIRECT](https://github.com/PowerScript/h2Polar/blob/main/h2polar.cfg#L65) - redirect domains
 
 ## https
 to https traffic _h2Polar_ use  "man in the middle" concept, the server certificates presented to the client are a copy dynamically generated/signed by the proxy.
@@ -37,7 +37,10 @@ so you need install _h2Polar.cer_ on your client to allow ssl traffic or ignore 
 ## pac script
 h2polar generate pac script according to rules, so you can set your http client with pac script: http://127.0.0.1:51234/h2Polar.pac.
 
-## build
+## builds
+    _lite_
+    gcc h2polar.c -o h2polar.exe -pthread -lssl -lcrypto -lgdi32 -lws2_32 -lGdiplus -Wall -static -DOPENSSL
+    _pool, cache, debug_
     gcc h2polar.c -o h2polar.exe -pthread -lssl -lcrypto -lgdi32 -lws2_32 -lGdiplus -Wall -static -DDEBUG -DDNS_MEM_CACHE -DCA_MEM_CACHE -DOPENSSL
 
 ## credits
