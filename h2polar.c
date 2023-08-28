@@ -19,14 +19,29 @@
 
 */
 
-#include <Winsock2.h>
+#ifdef _WIN32
+	#include <Winsock2.h>
+	#include <TlHelp32.h>
+	#include <Shlobj.h>
+	#include <gdiplus.h>
+	#include <ws2tcpip.h>
+	#include <Winhttp.h>
+#else
+	#include <sys/socket.h>
+	#include <netinet/in.h>
+	#include <netinet/ip.h>
+	#include <unistd.h>
+	#include <netdb.h>
+	#include <fcntl.h>
+	#include <pthread.h>
+	#include <string.h>
+  	#include <ctype.h>
+	#include <errno.h>
+	#include <stdlib.h>
+	#include <arpa/inet.h>
+#endif
 #include <stdio.h>
-#include <TlHelp32.h>
-#include <Shlobj.h>
-#include <gdiplus.h>
 #include <time.h>
-#include <ws2tcpip.h>
-#include <Winhttp.h>
 #ifdef OPENSSL
 	#include <openssl/crypto.h>
 	#include <openssl/x509.h>
@@ -46,7 +61,7 @@
 	#define __POOL_NTHREAD              20
 #endif
 #define __AUTHOR                        "RedToor"
-#define __VERSION                       "2022.02.01.1358"
+#define __VERSION                       "2023.08.27.1358"
 #define __CAPTURE_FILE                  "h2Polar.log"
 #define __DOWNLOAD_FOLDER               "%s"
 #define __CONFIG_FILE                    "h2polar.cfg"
@@ -102,6 +117,14 @@ enum {
 	INIT_BUFFER_SIZE
 };
 
+typedef enum
+{
+	PROXY_TO_PAGE,
+	PROXY_TO_CLIENT,
+	CLIENT_TO_PROXY,
+	PAGE_TO_PROXY
+} PROXY_FLOW;
+
 typedef enum 
 {
 	INIT,
@@ -109,6 +132,7 @@ typedef enum
 	BODY_REQUEST,
 	HEAD_RESPONSE,
 	BODY_RESPONSE,
+	FINISHED,
 	INIT_KEEPALIVE
 } HTTP_STAGE;
 
@@ -124,12 +148,15 @@ typedef enum  {
 	PUT,
 	POST,
 	HEAD,
-	DELETE_
+	DELETE_,
+	OPTIONS,
+	TRACE
 } PROXY_METHOD;
 
 typedef enum {
 	DIRECT,
 	CAPTURE,
+	MODIFY_BODY_REQUEST,
 	MODIFY_BODY_RESPONSE,
 	REDIRECT,
 	REJECT,
@@ -223,6 +250,11 @@ typedef struct _action {
 	struct _action* next;
 } action, *paction;
 
+typedef struct _client_connection {
+	struct sockaddr_in client_addr;
+	int client_socket;
+} client_connection, *pclient_connection;
+
 #ifdef OPENSSL
 	char hex_map[] = { '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'A', 'B', 'C', 'D', 'E', 'F' };
 	u_char alpn_protocol[] = { 8, 'h', 't', 't', 'p', '/', '1', '.', '1' };
@@ -247,6 +279,7 @@ typedef struct {
 	int sock_browser;
 	int sock_page;
 	int response_code;
+	client_connection connection;
 	PROXY_METHOD method;
 	PROXY_ACTION action;
 	HTTP_STAGE stage;
@@ -258,7 +291,7 @@ typedef struct {
 	reqinfo info;
 	headers headers_request;
 	headers headers_response;
-	DWORD thread_id;
+	u_long thread_id;
 	bool ssl;
 	bool connection_established;
 	u_int nrequests;
@@ -288,15 +321,14 @@ struct {
 		#endif
 	#endif
 	#ifdef DEBUG
-		CRITICAL_SECTION stdout_lock;
+		pthread_mutex_t stdout_lock;
 	#endif
 	#ifdef DNS_MEM_CACHE
-		CRITICAL_SECTION domain_cache_lock;
+		pthread_mutex_t domain_cache_lock;
 	#endif
-	CRITICAL_SECTION certificate_cache_lock;
+	pthread_mutex_t certificate_cache_lock;
 	pdomain_cache domain_cache;
-	HANDLE proxy_thread;
-	SOCKET socket;
+	int socket;
 	prule proxy_rules;
 	buffer pac_request;
 } proxy_config, *pproxy_config;
@@ -311,8 +343,8 @@ struct {
 	char* transfer_encoding;
 	char* proxy_connection;
 	char* keep_alive;
-	char* content_lentghrnrn;
 	char* content_lentgh;
+	char* content_lentghinject;
 	char* content_type;
 	char* upgrade;
 	char* websocket;
@@ -324,7 +356,6 @@ struct {
 	char* format_str_value_header;
 	char* chunked;
 	char* endchunk;
-	char* dot_bmp;
 	char* accept_encoding;
 	char* head_connection_established;
 	char* http_get;
@@ -339,31 +370,36 @@ struct {
 	char* pac_response_3;
 } const_char, *pconst_char;
 
-char* PROXY_ACTIONS[] = { [DIRECT] = "DIRECT", [CAPTURE] = "CAPTURE", [MODIFY_BODY_RESPONSE] = "MODIFY_BODY_RESPONSE", [REDIRECT] = "REDIRECT", 
+char* PROXY_ACTIONS[] = { [DIRECT] = "DIRECT", [CAPTURE] = "CAPTURE", [MODIFY_BODY_REQUEST] = "MODIFY_BODY_REQUEST", [MODIFY_BODY_RESPONSE] = "MODIFY_BODY_RESPONSE", [REDIRECT] = "REDIRECT", 
 						  [REJECT] = "REJECT", [SCREENSHOT] = "SCREENSHOT", [FAKE_TLS_EXT_HOSTNAME] = "FAKE_TLS_EXT_HOSTNAME", 
 						  [REMOVE_HEADER_REQUEST] = "REMOVE_HEADER_REQUEST", [REMOVE_HEADER_RESPONSE] = "REMOVE_HEADER_RESPONSE",
 						  [ADD_HEADER_REQUEST] = "ADD_HEADER_REQUEST", [ADD_HEADER_RESPONSE] = "ADD_HEADER_RESPONSE", [DOWNLOAD_CONTENT] = "DOWNLOAD_CONTENT" };
-char* PROXY_METHODS[] = { [UNKNOW] = "UNKNOW", [ALL] = "ALL", [CONNECT] = "CONNECT", [GET] = "GET", [PUT] = "PUT", [POST] = "POST", [HEAD] = "HEAD", [DELETE_] = "DELETE" };
+char* PROXY_METHODS[] = { [UNKNOW] = "UNKNOW", [ALL] = "ALL", [CONNECT] = "CONNECT", [GET] = "GET", [PUT] = "PUT", [POST] = "POST", [HEAD] = "HEAD", [DELETE_] = "DELETE", [OPTIONS] = "OPTIONS", [TRACE] = "TRACE" };
 char* KEY_SETTING[] = {   [_INTERFACE] = "INTERFACE", [PORT] = "PORT", [POOL_NTHREADS] = "POOL_NTHREADS", [TIMEOUT_CONNECT] = "TIMEOUT_CONNECT",
 						  [TIMEOUT_TUNNEL] = "TIMEOUT_TUNNEL", [INIT_BUFFER_SIZE] = "INIT_BUFFER_SIZE", [TLS_MITM] = "TLS_MITM"};
 
 #define RETN_OK return true;
 #define RETN_FAIL return false;
+#ifdef _WIN32
+	#define GET_SYSTEM_ERROR() WSAGetLastError()
+#else
+	#define GET_SYSTEM_ERROR() errno
+#endif
 
 #ifndef DEBUG
 	#define LOGGER(FORMAT, ...)
 #else
 	char* HTTP_SSL[] = { "NO", "YES" };
-	char* PROXY_STAGES[] = { [INIT] = "INIT", [HEAD_REQUEST] = "HEAD_REQUEST", [BODY_REQUEST] = "BODY_REQUEST", [HEAD_RESPONSE] = "HEAD_RESPONSE", [BODY_RESPONSE] = "BODY_RESPONSE", [INIT_KEEPALIVE] = "INIT_KEEPALIVE" };
-	#define LOGGER(FORMAT, ...) EnterCriticalSection(&proxy_config.stdout_lock); \
-									printf("%d\t%20s\t%lu\t%lu\t" FORMAT ".\n", __LINE__, __FUNCTION__, GetCurrentThreadId(), GetLastError(), ##__VA_ARGS__); \
-								LeaveCriticalSection(&proxy_config.stdout_lock);
+	char* PROXY_STAGES[] = { [INIT] = "INIT", [HEAD_REQUEST] = "HEAD_REQUEST", [BODY_REQUEST] = "BODY_REQUEST", [HEAD_RESPONSE] = "HEAD_RESPONSE", [BODY_RESPONSE] = "BODY_RESPONSE", [FINISHED] = "FINISHED", [INIT_KEEPALIVE] = "INIT_KEEPALIVE" };
+	#define LOGGER(FORMAT, ...) pthread_mutex_lock(&proxy_config.stdout_lock); \
+									printf("%d\t%20s\t%lu\t%lu\t" FORMAT ".\n", __LINE__, __FUNCTION__, pthread_self(), GET_SYSTEM_ERROR(), ##__VA_ARGS__); \
+								pthread_mutex_unlock(&proxy_config.stdout_lock);
 #endif
 
 #define ADD_ITEM(array, item) if (array == 0){ array = item; } else { item->next = array; } array = item;
 #define ITER_LLIST(item, array) for (item=array; item; item=item->next)
 #define CHECK_OP(execute) if (!execute) goto __exception;
-#define IF_EXTRADATA(action) action == MODIFY_BODY_RESPONSE || REDIRECT == action || action == FAKE_TLS_EXT_HOSTNAME || DOWNLOAD_CONTENT == action
+#define IF_EXTRADATA(action) action == MODIFY_BODY_RESPONSE || MODIFY_BODY_REQUEST == action || REDIRECT == action || action == FAKE_TLS_EXT_HOSTNAME || DOWNLOAD_CONTENT == action
 
 #define ADD_ACTION(actions, naction) ADD_ITEM(actions, naction)
 #define ADD_RULE(nrule) ADD_ITEM(proxy_config.proxy_rules, nrule)
@@ -385,7 +421,9 @@ void load_strings()
 	proxy_config.timeout_tunnel = __TIMEOUT_TUNNEL * 1000;
 	proxy_config.init_buffer_size = __INIT_SIZE_BUFFER;
 	proxy_config.cfg_file = __CONFIG_FILE;
+#ifdef THREAD_POOL
 	proxy_config.nthreads = __POOL_NTHREAD;
+#endif
 	const_char.http_get = "GET";
 	const_char.http_post = "POST";
 	const_char.http_connect = "CONNECT";
@@ -397,9 +435,9 @@ void load_strings()
 	const_char.parse_https_url = "https://%" IN2STR(MAX_HOSTNAME_SIZE) "[^/]%" IN2STR(MAX_URL_SIZE) "s";
 	const_char.parse_https_url_port = "https://%" IN2STR(MAX_HOSTNAME_SIZE) "[^:]:%d%" IN2STR(MAX_URL_SIZE) "[^\n]";
 	const_char.parse_response_code = "%*s %d %*s\r\n";
-	const_char.content_lentghrnrn = "Content-Length: %d\r\n\r\n";
 	const_char.transfer_encoding = "Transfer-Encoding:";
 	const_char.content_lentgh = "Content-Length:";
+	const_char.content_lentghinject = "Content-Length: %d";
 	const_char.content_type = "Content-Type:";
 	const_char.proxy_connection = "Proxy-Connection:";
 	const_char.connection = "Connection:";
@@ -413,7 +451,6 @@ void load_strings()
 	const_char.websocket = "websocket";
 	const_char.keep_alive = "keep-alive";
 	const_char.endchunk = "0\r\n\r\n";
-	const_char.dot_bmp = ".bmp";
 	const_char.screenshot = "sc";
 	const_char.head_pac_response = "HTTP/1.0 200\r\nContent-Type: application/x-ns-proxy-autoconfig\r\nConnection: Close\r\nContent-Length: %d\r\n\r\n";
 	const_char.head_connection_established = "HTTP/1.1 200 Connection established\r\n\r\n";
@@ -575,15 +612,15 @@ void load_strings()
 		
 			bin2hex(request->ssl_page->certificate->sha1_hash, sizeof(request->ssl_page->certificate->sha1_hash), hash_name, sizeof(hash_name));
 			sprintf(cache_hash, "%s", hash_name);
-			EnterCriticalSection(&proxy_config.certificate_cache_lock);
+			pthread_mutex_lock(&proxy_config.certificate_cache_lock);
 			ITER_LLIST(certificate, proxy_config.certificate_cache){
 				if (strcmp(certificate->cache_hash, cache_hash) == 0){
 					IF_GZERO(request->ssl_browser->certificate = X509_dup(certificate->certificate));
-					LeaveCriticalSection(&proxy_config.certificate_cache_lock);
+					pthread_mutex_unlock(&proxy_config.certificate_cache_lock);
 					RETN_OK
 				}
 			}
-			LeaveCriticalSection(&proxy_config.certificate_cache_lock);
+			pthread_mutex_unlock(&proxy_config.certificate_cache_lock);
 		#endif
 		if ((request->ssl_browser->certificate = X509_dup(request->ssl_page->certificate)) <= 0) goto __exception;
 		delete_extention(request->ssl_browser->certificate, NID_crl_distribution_points, -1);
@@ -597,9 +634,9 @@ void load_strings()
 			CHECK_ALLOC(certificate_cache, calloc, certificate, 1)
 			IF_GZERO(certificate->certificate = X509_dup(request->ssl_browser->certificate));
 			strcpy(certificate->cache_hash, cache_hash);
-			EnterCriticalSection(&proxy_config.certificate_cache_lock);
+			pthread_mutex_lock(&proxy_config.certificate_cache_lock);
 			ADD_CERTIFICATE_CACHE(certificate)
-			LeaveCriticalSection(&proxy_config.certificate_cache_lock);
+			pthread_mutex_unlock(&proxy_config.certificate_cache_lock);
 		#endif
 		RETN_OK
 		__exception:
@@ -657,7 +694,7 @@ int get_num_dig(unsigned size)
 #ifdef DEBUG
 	void printer(char* data, int size)
 	{
-		EnterCriticalSection(&proxy_config.stdout_lock);
+		pthread_mutex_lock(&proxy_config.stdout_lock);
 		printf("------------------------------------------------------------------------\n");
 		char a, line[17], c;
 		int j;
@@ -679,92 +716,95 @@ int get_num_dig(unsigned size)
 			}
 		}
 		printf("\n-----------------------------------------------------------------------%d\n", size);
-		LeaveCriticalSection(&proxy_config.stdout_lock);
+		pthread_mutex_unlock(&proxy_config.stdout_lock);
 	}
 #endif
 
-void write_bmp(HBITMAP bitmap, HDC hDC, LPTSTR filename)
-{
-	BITMAP bmp = {0}; 
-	BITMAPFILEHEADER hdr = {0};
-	PBITMAPINFO pbmi = 0; 
-	PBITMAPINFOHEADER pbih = 0;
-	DWORD dwTmp = 0; 
-	DWORD cb = 0;
-	WORD cClrBits = 0; 
-	HANDLE hf = 0;
-	LPBYTE lpBits = 0;
-	BYTE* hp = 0;
+#ifdef _WIN32
+	void write_bmp(HBITMAP bitmap, HDC hDC, LPTSTR filename)
+	{
+		BITMAP bmp = {0}; 
+		BITMAPFILEHEADER hdr = {0};
+		PBITMAPINFO pbmi = 0; 
+		PBITMAPINFOHEADER pbih = 0;
+		u_long dwTmp = 0; 
+		u_long cb = 0;
+		WORD cClrBits = 0; 
+		HANDLE hf = 0;
+		LPBYTE lpBits = 0;
+		BYTE* hp = 0;
 
-	if (GetObject(bitmap, sizeof(BITMAP), (LPSTR)&bmp)){
-		cClrBits = (WORD)(bmp.bmPlanes * bmp.bmBitsPixel); 
-		if (cClrBits == 1){ cClrBits = 1;  }
-		else if (cClrBits <= 4) {
-			cClrBits = 4;
-		} else if (cClrBits <= 8) {
-			cClrBits = 8;
-		} else if (cClrBits <= 16){
-			cClrBits = 16;
-		} else if (cClrBits <= 24){
-			cClrBits = 24;
-		} else					{
-			cClrBits = 32;
-		} if (cClrBits != 24){
-			pbmi = (PBITMAPINFO) LocalAlloc(LPTR, sizeof(BITMAPINFOHEADER) + sizeof(RGBQUAD) * (1 << cClrBits));
-		}else{
-			pbmi = (PBITMAPINFO) LocalAlloc(LPTR, sizeof(BITMAPINFOHEADER)); 
-		}
-		pbmi->bmiHeader.biSize = sizeof(BITMAPINFOHEADER); 
-		pbmi->bmiHeader.biWidth = bmp.bmWidth; 
-		pbmi->bmiHeader.biHeight = bmp.bmHeight; 
-		pbmi->bmiHeader.biPlanes = bmp.bmPlanes; 
-		pbmi->bmiHeader.biBitCount = bmp.bmBitsPixel; 
-		if (cClrBits < 24){
-			pbmi->bmiHeader.biClrUsed = (1 << cClrBits); 
-		}
-		pbmi->bmiHeader.biCompression = BI_RGB; 
-		pbmi->bmiHeader.biSizeImage = (pbmi->bmiHeader.biWidth + 7) / 8 * pbmi->bmiHeader.biHeight * cClrBits; 
-		pbmi->bmiHeader.biClrImportant = 0; 
-		pbih = (PBITMAPINFOHEADER) pbmi; 
-		if ((lpBits = (LPBYTE)GlobalAlloc(GMEM_FIXED, pbih->biSizeImage)) != 0){
-			if (GetDIBits(hDC, bitmap, 0, (WORD) pbih->biHeight, lpBits, pbmi, DIB_RGB_COLORS)){
-				if ((hf = CreateFile(filename, GENERIC_READ | GENERIC_WRITE, (DWORD) 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, (HANDLE)NULL)) != INVALID_HANDLE_VALUE){
-					hdr.bfType = 0x4D42;
-					hdr.bfSize = (DWORD)(sizeof(BITMAPFILEHEADER) + pbih->biSize + pbih->biClrUsed * sizeof(RGBQUAD) + pbih->biSizeImage);
-					hdr.bfReserved1 = 0;
-					hdr.bfReserved2 = 0; 
-					hdr.bfOffBits = (DWORD) sizeof(BITMAPFILEHEADER) + pbih->biSize + pbih->biClrUsed * sizeof (RGBQUAD);
-					WriteFile(hf, (LPVOID)&hdr, sizeof(BITMAPFILEHEADER), (LPDWORD) &dwTmp, NULL);
-					WriteFile(hf, (LPVOID)pbih, sizeof(BITMAPINFOHEADER) + pbih->biClrUsed * sizeof (RGBQUAD), (LPDWORD) &dwTmp, NULL);
-					cb = pbih->biSizeImage;
-					hp = lpBits; 
-					WriteFile(hf, (LPSTR)hp, (int)cb, (LPDWORD)&dwTmp, NULL);
-					CloseHandle(hf);
-				}
+		if (GetObject(bitmap, sizeof(BITMAP), (LPSTR)&bmp)){
+			cClrBits = (WORD)(bmp.bmPlanes * bmp.bmBitsPixel); 
+			if (cClrBits == 1){ cClrBits = 1;  }
+			else if (cClrBits <= 4) {
+				cClrBits = 4;
+			} else if (cClrBits <= 8) {
+				cClrBits = 8;
+			} else if (cClrBits <= 16){
+				cClrBits = 16;
+			} else if (cClrBits <= 24){
+				cClrBits = 24;
+			} else					{
+				cClrBits = 32;
+			} if (cClrBits != 24){
+				pbmi = (PBITMAPINFO) LocalAlloc(LPTR, sizeof(BITMAPINFOHEADER) + sizeof(RGBQUAD) * (1 << cClrBits));
+			}else{
+				pbmi = (PBITMAPINFO) LocalAlloc(LPTR, sizeof(BITMAPINFOHEADER)); 
 			}
-			GlobalFree((HGLOBAL)lpBits);
+			pbmi->bmiHeader.biSize = sizeof(BITMAPINFOHEADER); 
+			pbmi->bmiHeader.biWidth = bmp.bmWidth; 
+			pbmi->bmiHeader.biHeight = bmp.bmHeight; 
+			pbmi->bmiHeader.biPlanes = bmp.bmPlanes; 
+			pbmi->bmiHeader.biBitCount = bmp.bmBitsPixel; 
+			if (cClrBits < 24){
+				pbmi->bmiHeader.biClrUsed = (1 << cClrBits); 
+			}
+			pbmi->bmiHeader.biCompression = BI_RGB; 
+			pbmi->bmiHeader.biSizeImage = (pbmi->bmiHeader.biWidth + 7) / 8 * pbmi->bmiHeader.biHeight * cClrBits; 
+			pbmi->bmiHeader.biClrImportant = 0; 
+			pbih = (PBITMAPINFOHEADER) pbmi; 
+			if ((lpBits = (LPBYTE)GlobalAlloc(GMEM_FIXED, pbih->biSizeImage)) != 0){
+				if (GetDIBits(hDC, bitmap, 0, (WORD) pbih->biHeight, lpBits, pbmi, DIB_RGB_COLORS)){
+					if ((hf = CreateFile(filename, GENERIC_READ | GENERIC_WRITE, (u_long) 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, (HANDLE)NULL)) != INVALID_HANDLE_VALUE){
+						hdr.bfType = 0x4D42;
+						hdr.bfSize = (u_long)(sizeof(BITMAPFILEHEADER) + pbih->biSize + pbih->biClrUsed * sizeof(RGBQUAD) + pbih->biSizeImage);
+						hdr.bfReserved1 = 0;
+						hdr.bfReserved2 = 0; 
+						hdr.bfOffBits = (u_long) sizeof(BITMAPFILEHEADER) + pbih->biSize + pbih->biClrUsed * sizeof (RGBQUAD);
+						WriteFile(hf, (LPVOID)&hdr, sizeof(BITMAPFILEHEADER), (LPu_long) &dwTmp, NULL);
+						WriteFile(hf, (LPVOID)pbih, sizeof(BITMAPINFOHEADER) + pbih->biClrUsed * sizeof (RGBQUAD), (LPu_long) &dwTmp, NULL);
+						cb = pbih->biSizeImage;
+						hp = lpBits; 
+						WriteFile(hf, (LPSTR)hp, (int)cb, (LPu_long)&dwTmp, NULL);
+						CloseHandle(hf);
+					}
+				}
+				GlobalFree((HGLOBAL)lpBits);
+			}
+			GlobalFree((HGLOBAL)pbmi);
 		}
-		GlobalFree((HGLOBAL)pbmi);
 	}
-}
 
-bool generate_bmp(int x, int y, int width, int height)
-{
-	HDC hdc = 0;
-	HBITMAP hbitmap = 0;
-	char bmp_file[MAX_PATH] = {0};
-
-	srand(time(NULL));
-	sprintf(bmp_file, "%s%d%s", const_char.screenshot, (15535 + rand() % (65000 + 1 - 15535)), const_char.dot_bmp);
-	IF_GZERO(hdc = CreateCompatibleDC(0));
-	IF_GZERO(hbitmap = CreateCompatibleBitmap(GetDC(0), width, height));
-	IF_GZERO(SelectObject(hdc, hbitmap));
-	BitBlt(hdc, 0, 0, width, height, GetDC(0), x, y, SRCCOPY);
-	write_bmp(hbitmap, hdc, bmp_file);
-	DeleteObject(hbitmap);
-	DeleteDC(hdc);
-	RETN_OK
-}
+	bool generate_bmp(int x, int y, int width, int height)
+	{
+		HDC hdc = 0;
+		HBITMAP hbitmap = 0;
+		time_t t = time(NULL);
+		struct tm tm = *localtime(&t);
+		char bmp_file[MAX_PATH] = {0};
+		
+		sprintf(bmp_file, "%s-%d%02d%02d-%02d%02d%02d.bmp", const_char.screenshot, tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec);
+		IF_GZERO(hdc = CreateCompatibleDC(0));
+		IF_GZERO(hbitmap = CreateCompatibleBitmap(GetDC(0), width, height));
+		IF_GZERO(SelectObject(hdc, hbitmap));
+		BitBlt(hdc, 0, 0, width, height, GetDC(0), x, y, SRCCOPY);
+		write_bmp(hbitmap, hdc, bmp_file);
+		DeleteObject(hbitmap);
+		DeleteDC(hdc);
+		RETN_OK
+	}
+#endif
 
 bool compare(char* init, int count, char* str, int count2)
 {
@@ -776,7 +816,7 @@ bool compare(char* init, int count, char* str, int count2)
 	RETN_OK
 }
 
-bool check_filter(char* mask_filter, char* str, char delimiter)
+bool url_filter(char* mask_filter, char* str, char delimiter)
 {
 	u_int size_incomming = 0;
 	u_int size_domain = 0;
@@ -809,6 +849,35 @@ bool check_filter(char* mask_filter, char* str, char delimiter)
 		}
 	}
 	return end;
+}
+
+bool hostname_filter(char* mask_filter, char* input, char delimiter)
+{
+	int string_length = strlen(input) - 1;
+	int m = strlen(mask_filter) - 1;
+	bool mask = false;
+
+	for (int i = string_length; i != -1 ; --i)
+	{
+		if (input[i] == delimiter){
+			mask = false;
+		}
+		if (mask_filter[m] == '*') {
+			mask = true;
+			if(m == 0){
+				RETN_OK
+			}
+			m--;
+		}
+		if (input[i] != mask_filter[m] && !mask){
+			RETN_FAIL
+		}
+		if (!mask)
+		{
+			m--;
+		}
+	}
+	RETN_OK
 }
 
 void generate_pac_response()
@@ -856,10 +925,20 @@ void close_handle(pclient request)
 	LOGGER("<+free/closing objects/sockets")
 	if (request != 0){
 		if (request->sock_browser > 0){
-			closesocket(request->sock_browser);
+			#ifdef _WIN32
+				closesocket(request->sock_browser);
+			#else
+				shutdown(request->sock_browser, SHUT_RDWR);
+				close(request->sock_browser);
+			#endif
 		}
 		if (request->sock_page > 0){
-			closesocket(request->sock_page);
+			#ifdef _WIN32
+				closesocket(request->sock_page);
+			#else
+				shutdown(request->sock_page, SHUT_RDWR);
+				close(request->sock_page);
+			#endif
 		}
 		if (request->head_request.size_block > 0){
 			free(request->head_request.pointer);
@@ -929,6 +1008,12 @@ bool get_method(char* buffer, u_int* method)
 	} else if (strncmp(buffer, PROXY_METHODS[DELETE_], 6) == 0){
 		*method = DELETE_;
 		RETN_OK
+	} else if (strncmp(buffer, PROXY_METHODS[OPTIONS], 6) == 0){
+		*method = OPTIONS;
+		RETN_OK
+	} else if (strncmp(buffer, PROXY_METHODS[TRACE], 6) == 0){
+		*method = TRACE;
+		RETN_OK
 	}
 	RETN_FAIL
 }
@@ -942,48 +1027,74 @@ bool allow_buffer_space(char** pointer, u_int* written, u_int* size_block)
 	RETN_OK
 }
 
-int output_buffer(bool is_ssl, int socket, pssl_layer ssl, char* pointer, u_int size)
+int read_socket_buffer(pclient request, PROXY_FLOW flow, char* pointer, u_int size)
 {
 	int incomming = 0;
+	int socket = 0;
+	#ifdef OPENSSL
+		pssl_layer ssl = 0;
+	#endif
 
-	if (is_ssl){
-		if ((incomming = SSL_write(ssl->connection, pointer, size)) <= 0){
-			#ifdef DEBUG
-				int error = SSL_get_error(ssl->connection, incomming);
-				LOGGER("---->ssl_write %d %d %d %d %s", incomming, error, size, WSAGetLastError(), ERR_error_string(error, 0))
-			#endif
-		}
-	} else {
-		incomming = send(socket, pointer, size, 0);
+	if(flow == CLIENT_TO_PROXY){
+		#ifdef OPENSSL
+			ssl = request->ssl_browser;
+		#endif
+		socket = request->sock_browser;
+	} else if(flow == PAGE_TO_PROXY){
+		#ifdef OPENSSL
+			ssl = request->ssl_page;
+		#endif
+		socket = request->sock_page;
 	}
-	return incomming;
-}
-
-int input_buffer(bool is_ssl, int socket, pssl_layer ssl, char* pointer, u_int size)
-{
-	int incomming = 0;
-	
-	if (is_ssl){
-		if ((incomming = SSL_read(ssl->connection, pointer, size)) <= 0){
-			#ifdef DEBUG
-				int error = SSL_get_error(ssl->connection, incomming);
-				LOGGER("---->ssl_read %d %d %d %d %s", incomming, error, size, WSAGetLastError(), ERR_error_string(error, 0))
-			#endif
-		}
+	if (request->ssl){
+		#ifdef OPENSSL
+			if ((incomming = SSL_read(ssl->connection, pointer, size)) <= 0){
+				#ifdef DEBUG
+					int error = SSL_get_error(ssl->connection, incomming);
+					LOGGER("---->ssl_read %d %d %d %d %s", incomming, error, size, GET_SYSTEM_ERROR(), ERR_error_string(error, 0))
+				#endif
+			}
+		#endif 
 	} else {
 		incomming = recv(socket, pointer, size, 0);
 	}
 	return incomming;
 }
 
-bool send_buffer(bool is_ssl, int socket, pssl_layer ssl, char* buffer, u_int size)
+bool write_socket_buffer(pclient request, PROXY_FLOW flow, char* buffer, u_int size)
 {
 	u_int total_sent = 0;
-	int outcomming_buffer = 0;
+	int socket = 0;
+	int incomming = 0;
+	#ifdef OPENSSL
+		pssl_layer ssl = 0;
+	#endif
 
+	if(flow == PROXY_TO_CLIENT){
+		#ifdef OPENSSL
+			ssl = request->ssl_browser;
+		#endif
+		socket = request->sock_browser;
+	} else if(flow == PROXY_TO_PAGE){
+		#ifdef OPENSSL
+			ssl = request->ssl_page;
+		#endif
+		socket = request->sock_page;
+	}
 	while (total_sent != size){
-		IF_GZERO(outcomming_buffer = output_buffer(is_ssl, socket, ssl, buffer + total_sent, size - total_sent))
-		total_sent += (u_int)outcomming_buffer;
+		if (request->ssl){
+			#ifdef OPENSSL
+				if ((incomming = SSL_write(ssl->connection, buffer + total_sent, size - total_sent)) <= 0){
+					#ifdef DEBUG
+						int error = SSL_get_error(ssl->connection, incomming);
+						LOGGER("---->ssl_write %d %d %d %d %s", incomming, error, size, GET_SYSTEM_ERROR(), ERR_error_string(error, 0))
+					#endif
+				}
+			#endif
+		} else {
+			incomming = send(socket, buffer, size, 0);
+		}
+		total_sent += (u_int)incomming;
 	}
 	RETN_OK
 }
@@ -1023,7 +1134,7 @@ bool remove_http_header(pbuffer head_buffer, char* headname)
 	RETN_FAIL
 }
 
-bool get_body_request(bool is_ssl, int socket, pssl_layer ssl, pbuffer buffer, int content_length, pclient request)
+bool get_body_request(pclient request, PROXY_FLOW flow, pbuffer buffer, int content_length)
 {
 	int incomming_buffer = 0;
 
@@ -1034,10 +1145,10 @@ bool get_body_request(bool is_ssl, int socket, pssl_layer ssl, pbuffer buffer, i
 		buffer->size_block = content_length;
 	}
 	while (buffer->written != content_length){
-		IF_GZERO(incomming_buffer = input_buffer(is_ssl, socket, ssl, buffer->pointer + buffer->written, content_length - buffer->written))
+		IF_GZERO(incomming_buffer = read_socket_buffer(request, flow, buffer->pointer + buffer->written, content_length - buffer->written))
 		if (request != 0){
 			if (request->action != MODIFY_BODY_RESPONSE){
-				IF_GZERO(send_buffer(request->ssl, request->sock_browser, request->ssl_browser, buffer->pointer + buffer->written, incomming_buffer))
+				IF_GZERO(write_socket_buffer(request, PROXY_TO_CLIENT, buffer->pointer + buffer->written, incomming_buffer))
 			}
 		}
 		buffer->written += incomming_buffer;
@@ -1045,13 +1156,13 @@ bool get_body_request(bool is_ssl, int socket, pssl_layer ssl, pbuffer buffer, i
 	RETN_OK
 }
 
-bool get_headers_request(bool is_ssl, int socket, pssl_layer ssl, pbuffer buffer)
+bool get_headers_request(pclient request, PROXY_FLOW flow, pbuffer buffer)
 {
 	int incomming_buffer = 0;
 
 	while (true){
 		IF_GZERO(allow_buffer_space(&buffer->pointer, &buffer->written, &buffer->size_block))
-		IF_GZERO(incomming_buffer = input_buffer(is_ssl, socket, ssl, buffer->pointer + buffer->written, 1))
+		IF_GZERO(incomming_buffer = read_socket_buffer(request, flow, buffer->pointer + buffer->written, 1))
 		buffer->written += incomming_buffer;
 		if (buffer->written > 10){
 			if (buffer->pointer[buffer->written - 1] == '\n' && buffer->pointer[buffer->written - 2] == '\r' && buffer->pointer[buffer->written - 3] == '\n' && buffer->pointer[buffer->written - 4] == '\r'){
@@ -1109,12 +1220,12 @@ bool get_request(pclient request)
 {
 	LOGGER("--->getting http request")
 	request->stage = HEAD_REQUEST;
-	IF_GZERO(get_headers_request(request->ssl, request->sock_browser, request->ssl_browser, &request->head_request))
+	IF_GZERO(get_headers_request(request, CLIENT_TO_PROXY, &request->head_request))
 	IF_GZERO(get_method(request->head_request.pointer, &request->method))
 	parse_headers(&request->head_request, &request->headers_request);
 	request->stage = BODY_REQUEST;
 	if (request->method == POST && request->headers_request.content_length > 0){
-		IF_GZERO(get_body_request(request->ssl, request->sock_browser, request->ssl_browser, &request->body_request, request->headers_request.content_length, 0))
+		IF_GZERO(get_body_request(request, CLIENT_TO_PROXY, &request->body_request, request->headers_request.content_length))
 	}
 	RETN_OK
 }
@@ -1225,15 +1336,15 @@ bool lookup_domain(struct sockaddr_in* sockinfo, char* domain)
 	#ifdef DNS_MEM_CACHE
 		pdomain_cache local_domain = 0;
 
-		EnterCriticalSection(&proxy_config.domain_cache_lock);
+		pthread_mutex_lock(&proxy_config.domain_cache_lock);
 		ITER_LLIST(local_domain, proxy_config.domain_cache){
 			if (strcmp(local_domain->domain, domain) == 0){
 				sockinfo->sin_addr.s_addr = local_domain->ip;
-				LeaveCriticalSection(&proxy_config.domain_cache_lock);
+				pthread_mutex_unlock(&proxy_config.domain_cache_lock);
 				RETN_OK
 			}
 		}
-		LeaveCriticalSection(&proxy_config.domain_cache_lock);
+		pthread_mutex_unlock(&proxy_config.domain_cache_lock);
 	#endif
 	if ((addr = inet_addr(domain)) != INADDR_NONE){
 		memcpy((void*)&sockinfo->sin_addr, &addr, sizeof(u_long));
@@ -1271,20 +1382,20 @@ bool lookup_domain(struct sockaddr_in* sockinfo, char* domain)
 			CHECK_ALLOC(domain_cache, calloc, local_domain, 1)
 			strcpy(local_domain->domain, domain);
 			local_domain->ip = sockinfo->sin_addr.s_addr;
-			EnterCriticalSection(&proxy_config.domain_cache_lock);
+			pthread_mutex_lock(&proxy_config.domain_cache_lock);
 			ADD_DOMAIN_CACHE(local_domain)
-			LeaveCriticalSection(&proxy_config.domain_cache_lock);
+			pthread_mutex_unlock(&proxy_config.domain_cache_lock);
 			RETN_OK
 	#endif
 }
 
-bool set_socket_timeout(int socket, u_int timeout)
+bool set_socket_timeout(int sock, u_int timeout)
 {
 	u_long ltimeout = timeout;
 
-	IF_ZERO(setsockopt(socket, SOL_SOCKET, SO_RCVTIMEO, (void*)&ltimeout, sizeof(u_long)))
+	setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (void*)&ltimeout, sizeof(u_long));
 	ltimeout = timeout;
-	IF_ZERO(setsockopt(socket, SOL_SOCKET, SO_SNDTIMEO, (void*)&ltimeout, sizeof(u_long)))
+	setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (void*)&ltimeout, sizeof(u_long));
 	RETN_OK
 }
 
@@ -1297,7 +1408,7 @@ bool socket_connection(pclient request)
 	page.sin_port = htons(request->info.port);
 	page.sin_family = 2;
 	set_socket_timeout(request->sock_page, proxy_config.timeout_connect);
-	if (connect(request->sock_page, (struct sockaddr*)&page, sizeof(page)) != SOCKET_ERROR){
+	if (connect(request->sock_page, (struct sockaddr*)&page, sizeof(page)) != -1){
 		RETN_OK
 	}
 	RETN_FAIL
@@ -1306,123 +1417,69 @@ bool socket_connection(pclient request)
 bool send_pac_response(pclient request)
 {
 	LOGGER("->pac request")
-	IF_GZERO(send_buffer(false, request->sock_browser, 0, proxy_config.pac_request.pointer, proxy_config.pac_request.written))
+	IF_GZERO(write_socket_buffer(request, PROXY_TO_CLIENT, proxy_config.pac_request.pointer, proxy_config.pac_request.written))
 	request->action = REJECT;
 	RETN_OK
 }
 
-void take_screenshot()
-{
-	GdiplusStartupInput gdiplusStartupInput = {0};
-	ULONG_PTR gdiplusToken = 0;
-	int x1 = 0;
-	int y1 = 0;
-	int x2 = 0;
-	int y2 = 0;
+#ifdef _WIN32
+	void apply_screenshot()
+	{
+		GdiplusStartupInput gdiplusStartupInput = {0};
+		ULONG_PTR gdiplusToken = 0;
+		int x1 = 0;
+		int y1 = 0;
+		int x2 = 0;
+		int y2 = 0;
 
-	gdiplusStartupInput.GdiplusVersion = 1;
-	GdiplusStartup(&gdiplusToken, &gdiplusStartupInput, NULL);
-	x2 = GetSystemMetrics(SM_CXSCREEN);
-	y2 = GetSystemMetrics(SM_CYSCREEN);
-	generate_bmp(x1, y1, x2 - x1, y2 - y1);
-	GdiplusShutdown(gdiplusToken);
-}
-
-bool apply_injection(pclient request, pinjection injection)
-{
-	char* offset_inj = 0;
-	int fix_length = 0;
-	int right_block = 0;
-	int head_right_block = 0;
-	int fix_lentgh_digits = 0;
-	int fix_length_original = 0;
-	int ndigits = 0;
-
-	if (request->stage == BODY_REQUEST){
-		remove_http_header(&request->head_request, const_char.accept_encoding);
-	} else if (request->stage == BODY_RESPONSE){
-		IF_GZERO(request->body_response.pointer)
-		if ((offset_inj = strnstr(request->body_response.pointer, request->body_response.written, injection->prefix, injection->prefix_length))){
-			fix_length = (request->body_response.written - injection->prefix_length) + injection->inject_length;
-			right_block = request->body_response.written - (offset_inj - request->body_response.pointer) - injection->prefix_length;
-			fix_lentgh_digits = get_num_dig(fix_length);
-			ndigits = fix_lentgh_digits - fix_length_original;
-			LOGGER("----->injecting body: real body %d, content_length %d, necesary size %d", request->body_response.written, request->headers_response.content_length, fix_length)
-			if (ndigits > 0 && request->headers_response.content_length_offset > 0){
-				head_right_block = request->head_response.written - (request->headers_response.content_length_offset - request->head_response.pointer) - fix_length_original;
-				if (request->head_response.written == request->head_response.size_block){
-					request->head_response.size_block += ndigits;
-					CHECK_REALLOC(char, realloc, request->head_response.pointer, request->head_response.pointer, sizeof(char) * request->head_response.size_block)
-					request->head_response.written = request->head_response.size_block;
-				} else {
-					request->head_response.written += ndigits;
-				}
-				memmove(request->headers_response.content_length_offset + fix_lentgh_digits, request->headers_response.content_length_offset + fix_length_original, head_right_block);
-			}
-			if (fix_length > request->body_response.size_block){
-				request->body_response.size_block = fix_length;
-				request->body_response.written = request->body_response.size_block;
-				CHECK_REALLOC(char, realloc, request->body_response.pointer, request->body_response.pointer, sizeof(char) * request->body_response.size_block)
-				offset_inj = strnstr(request->body_response.pointer, request->body_response.written, injection->prefix, injection->prefix_length);
-			} else {
-				request->body_response.written = fix_length;
-			}
-			memmove(offset_inj + injection->inject_length, offset_inj + injection->prefix_length, right_block);
-			memcpy(offset_inj, injection->inject, injection->inject_length);
-		}
-		if (request->headers_response.chunked){
-			remove_http_header(&request->head_response, const_char.transfer_encoding);
-			fix_length = 20 + get_num_dig(request->body_response.written);
-			if ((request->head_response.size_block - request->head_response.written) <= (request->head_response.written + fix_length)){
-				request->head_response.size_block = request->head_response.written + fix_length;
-				CHECK_REALLOC(char, realloc, request->head_response.pointer, request->head_response.pointer, sizeof(char) * request->head_response.size_block)
-			}
-			snprintf(request->head_response.pointer + request->head_response.written - 2, fix_length, const_char.content_lentghrnrn, request->body_response.written);
-			request->head_response.written += (fix_length - 2);
-		}
-		if (request->headers_response.content_length_offset > 0) {
-			snprintf(request->headers_response.content_length_offset, fix_lentgh_digits, "%d", request->body_response.written);
-			request->headers_response.content_length = request->body_response.written;
-		}
+		LOGGER("----->taking screenshot");
+		gdiplusStartupInput.GdiplusVersion = 1;
+		GdiplusStartup(&gdiplusToken, &gdiplusStartupInput, NULL);
+		x2 = GetSystemMetrics(SM_CXSCREEN);
+		y2 = GetSystemMetrics(SM_CYSCREEN);
+		generate_bmp(x1, y1, x2 - x1, y2 - y1);
+		GdiplusShutdown(gdiplusToken);
 	}
-	RETN_OK
-}
+#endif
 
 bool apply_capture(pclient request)
 {
 	FILE* log_file = 0;
+	time_t t = time(NULL);
+	struct tm tm = *localtime(&t);
+	char buffer[1024] = {0};
 
+	LOGGER("----->apply capture");
+	sprintf(buffer, "->REACHED: %d-%02d-%02d %02d:%02d:%02d from %s:%d\n------------------------------------------------------------------------------------------------------------>HEAD_REQUEST (%d):\n", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec, inet_ntoa(request->connection.client_addr.sin_addr), ntohs(request->connection.client_addr.sin_port), request->head_request.written);
 	IF_GZERO(log_file = fopen(__CAPTURE_FILE, "a"))
-	if (request->stage == BODY_REQUEST){
-		fwrite(request->head_request.pointer, sizeof(char), request->head_request.written, log_file);
-		if (request->body_request.written > 0){
-			fwrite(request->body_request.pointer, sizeof(char), request->body_request.written, log_file);
-			fwrite("\n", sizeof(char), 1, log_file);
-		}
-	} else if (request->stage == BODY_RESPONSE){
-		fwrite(request->head_response.pointer, sizeof(char), request->head_response.written, log_file);
+	fwrite(buffer, sizeof(char), strlen(buffer), log_file);
+	fwrite(request->head_request.pointer, sizeof(char), request->head_request.written - 4, log_file);
+	if (request->body_request.written > 0){
+		sprintf(buffer, "\n------------------------------------------------------------------------------------------------------------>BODY_REQUEST (%d):\n", request->body_request.written);
+		fwrite(buffer, sizeof(char), strlen(buffer), log_file);
+		fwrite(request->body_request.pointer, sizeof(char), request->body_request.written, log_file);
+		fwrite("\n", sizeof(char), 1, log_file);
 	}
-	fwrite("-----------------------------------------------------\n", sizeof(char), 54, log_file);
+	sprintf(buffer, "\n------------------------------------------------------------------------------------------------------------>HEAD_RESPONSE (%d):\n", request->head_response.written);
+	fwrite(buffer, sizeof(char), strlen(buffer), log_file);
+	fwrite(request->head_response.pointer, sizeof(char), request->head_response.written - 4, log_file);
+	fwrite("\n------------------------------------------------------------------------------------------------------------>END\n", sizeof(char), 114, log_file);
 	fclose(log_file);
 	RETN_OK
 }
 
 bool apply_redirect(pclient request, predirect redirect)
 {
-	if (request->stage == BODY_REQUEST){
-		LOGGER("----->redirecting %s:%d -> %s:%d", request->info.hostname, request->info.port, redirect->hostname, redirect->port);
-		strcpy(request->info.hostname, redirect->hostname);
-		request->info.port = redirect->port;
-	}
+	LOGGER("----->redirecting %s:%d -> %s:%d", request->info.hostname, request->info.port, redirect->hostname, redirect->port);
+	strcpy(request->info.hostname, redirect->hostname);
+	request->info.port = redirect->port;
 	RETN_OK
 }
 
 bool apply_fake_tls_hostname(pclient request, pfake_tls_ext_hostname fake_tls_ext_hostname)
 {
-	if (request->stage == BODY_REQUEST){
-		LOGGER("----->fake tls ext hostname %s -> %s", request->info.hostname, fake_tls_ext_hostname->hostname);
-		strcpy(request->info.tls_ext_hostname, fake_tls_ext_hostname->hostname);
-	}
+	LOGGER("----->fake tls ext hostname %s -> %s", request->info.hostname, fake_tls_ext_hostname->hostname);
+	strcpy(request->info.tls_ext_hostname, fake_tls_ext_hostname->hostname);
 	RETN_OK
 }
 
@@ -1441,29 +1498,19 @@ bool file_output(char* path, char* flag, char* buffer, u_int size)
 	RETN_OK
 }
 
-void apply_screenshot(pclient request)
-{
-	if (request->stage == BODY_REQUEST || BODY_RESPONSE == request->stage){
-		LOGGER("----->taking screenshot");
-		take_screenshot();
-	}
-}
-
 bool apply_download_content(pclient request, pdownload_content download_content)
 {
 	char filename[3026] = {0};
 	char url[2024] = {0};
-
-	if (request->stage == BODY_RESPONSE){
-		if (!strcmp(download_content->content_type, request->headers_response.content_type)){
-			LOGGER("----->downloading content %s %s %d bytes %s", request->info.hostname, request->info.url, request->body_response.written, download_content->content_type);
-			strcpy(url, request->info.url);
-			for (int i = 0; i < strlen(url); ++i){
-				if (url[i] == '/') url[i] = DOWNLOAD_CONTENT_SLASH_REMPLACE;
-			}
-			sprintf(filename, __DOWNLOAD_FOLDER, url);
-			file_output(filename, "wb", request->body_response.pointer, request->body_response.written);
+	
+	if (!strcmp(download_content->content_type, request->headers_response.content_type) || !strcmp(download_content->content_type, "*")){
+		LOGGER("----->downloading content %s %s %d bytes %s", request->info.hostname, request->info.url, request->body_response.written, download_content->content_type);
+		strcpy(url, request->info.url);
+		for (int i = 0; i < strlen(url); ++i){
+			if (url[i] == '/') url[i] = DOWNLOAD_CONTENT_SLASH_REMPLACE;
 		}
+		sprintf(filename, __DOWNLOAD_FOLDER, url);
+		file_output(filename, "wb", request->body_response.pointer, request->body_response.written);
 	}
 	RETN_OK
 }
@@ -1485,6 +1532,62 @@ void apply_header_actions(pclient request, PROXY_ACTION action, phead header)
 	}
 }
 
+void apply_reject(pclient request)
+{
+	LOGGER("----->request rejected: %s", request->info.hostname);
+}
+
+bool apply_modify_buffer(pclient request, pbuffer http_head, pbuffer http_body, headers header, pinjection injection)
+{
+	char* offset_inj = 0;
+	int fix_length = 0;
+	int right_block = 0;
+	int head_right_block = 0;
+	int fix_lentgh_digits = 0;
+	int fix_length_original = 0;
+	int ndigits = 0;
+	char content_length[100] = {0};
+
+	IF_GZERO(http_body->pointer)
+	if ((offset_inj = strnstr(http_body->pointer, http_body->written, injection->prefix, injection->prefix_length))){
+		fix_length = (http_body->written - injection->prefix_length) + injection->inject_length;
+		right_block = http_body->written - (offset_inj - http_body->pointer) - injection->prefix_length;
+		fix_lentgh_digits = get_num_dig(fix_length);
+		ndigits = fix_lentgh_digits - fix_length_original;
+		LOGGER("----->modifying body: real body %d, content_length %d, necesary size %d", http_body->written, header.content_length, fix_length)
+		if (ndigits > 0 && header.content_length_offset > 0){
+			head_right_block = http_head->written - (header.content_length_offset - http_head->pointer) - fix_length_original;
+			if (http_head->written == http_head->size_block){
+				http_head->size_block += ndigits;
+				CHECK_REALLOC(char, realloc, http_head->pointer, http_head->pointer, sizeof(char) * http_head->size_block)
+				http_head->written = http_head->size_block;
+			} else {
+				http_head->written += ndigits;
+			}
+			memmove(header.content_length_offset + fix_lentgh_digits, header.content_length_offset + fix_length_original, head_right_block);
+		}
+		if (fix_length > http_body->size_block){
+			http_body->size_block = fix_length;
+			http_body->written = http_body->size_block;
+			CHECK_REALLOC(char, realloc, http_body->pointer, http_body->pointer, sizeof(char) * http_body->size_block)
+			offset_inj = strnstr(http_body->pointer, http_body->written, injection->prefix, injection->prefix_length);
+		} else {
+			http_body->written = fix_length;
+		}
+		memmove(offset_inj + injection->inject_length, offset_inj + injection->prefix_length, right_block);
+		memcpy(offset_inj, injection->inject, injection->inject_length);
+		if (header.chunked){
+			remove_http_header(http_head, const_char.transfer_encoding);
+		} else if (header.content_length_offset > 0){
+			remove_http_header(http_head, const_char.content_lentgh);
+		}
+		sprintf(content_length, const_char.content_lentghinject, http_body->written);
+		add_http_header(http_head, content_length, strlen(content_length));
+		header.content_length = http_body->written;
+	}
+	RETN_OK
+}
+
 int apply_action(pclient request)
 {
 	paction config = 0;
@@ -1495,22 +1598,42 @@ int apply_action(pclient request)
 			case DIRECT:
 				break;
 			case CAPTURE:
-				apply_capture(request);
+				if (request->stage == FINISHED){
+					apply_capture(request);
+				}
+				break;
+			case MODIFY_BODY_REQUEST:
+				if (request->stage == BODY_REQUEST){
+					apply_modify_buffer(request, &request->head_request, &request->body_request, request->headers_request, ((pinjection)config->extra_data));
+				}
 				break;
 			case MODIFY_BODY_RESPONSE:
 				request->action = MODIFY_BODY_RESPONSE;
-				apply_injection(request, ((pinjection)config->extra_data));
+				if (request->stage == BODY_REQUEST){
+					remove_http_header(&request->head_request, const_char.accept_encoding);
+				} else if (request->stage == BODY_RESPONSE){
+					apply_modify_buffer(request, &request->head_response, &request->body_response, request->headers_response, ((pinjection)config->extra_data));
+				}
 				break;
 			case REDIRECT:
-				apply_redirect(request, ((predirect)config->extra_data));
+				if (request->stage == BODY_REQUEST){
+					apply_redirect(request, ((predirect)config->extra_data));
+				}
 				break;
 			case REJECT:
+				apply_reject(request);
 				return REJECT;
 			case SCREENSHOT:
-				apply_screenshot(request);
+				#ifdef _WIN32
+					if (request->stage == BODY_REQUEST || BODY_RESPONSE == request->stage){
+						apply_screenshot();
+					}
+				#endif
 				break;
 			case FAKE_TLS_EXT_HOSTNAME:
-				apply_fake_tls_hostname(request, ((pfake_tls_ext_hostname)config->extra_data));
+				if (request->stage == BODY_REQUEST){
+					apply_fake_tls_hostname(request, ((pfake_tls_ext_hostname)config->extra_data));
+				}
 				break;
 			case REMOVE_HEADER_REQUEST:
 			case REMOVE_HEADER_RESPONSE:
@@ -1519,7 +1642,9 @@ int apply_action(pclient request)
 				apply_header_actions(request, config->action, ((phead)config->extra_data));
 				break;
 			case DOWNLOAD_CONTENT:
-				apply_download_content(request, ((pdownload_content)config->extra_data));
+				if (request->stage == FINISHED){
+					apply_download_content(request, ((pdownload_content)config->extra_data));
+				}
 				break;
 		}
 	}
@@ -1538,14 +1663,14 @@ bool check_action(pclient request)
 		RETN_OK
 	}
 	ITER_LLIST(proxy_rule, proxy_config.proxy_rules){
-		if (check_filter(proxy_rule->domain, request->info.hostname, '.') &&
-			check_filter(proxy_rule->url, request->info.url, '/') &&
+		if (hostname_filter(proxy_rule->domain, request->info.hostname, '.') &&
+			url_filter(proxy_rule->url, request->info.url, '/') &&
 			(proxy_rule->method == request->method || proxy_rule->method == ALL) &&
 			proxy_rule->port == request->info.port && 
 			proxy_rule->ssl == request->ssl){
 			CHECK_ALLOC(action, calloc, naction, 1)
 			naction->action = proxy_rule->action;
-			if (naction->action == MODIFY_BODY_RESPONSE){
+			if (naction->action == MODIFY_BODY_RESPONSE || MODIFY_BODY_REQUEST == naction->action){
 				CHECK_ALLOC(injection, calloc, naction->extra_data, 1)
 				memcpy(naction->extra_data, proxy_rule->extra_data, sizeof(injection));
 			} else if (naction->action == REDIRECT){
@@ -1562,17 +1687,17 @@ bool check_action(pclient request)
 				memcpy(naction->extra_data, proxy_rule->extra_data, sizeof(head));
 			}
 			ADD_ACTION(request->actions, naction);
-			LOGGER("--->rule reached, an action was added: M[%s]SSL[%s]A[%s] :%d:%s:%s", PROXY_METHODS[proxy_rule->method], HTTP_SSL[proxy_rule->ssl], PROXY_ACTIONS[proxy_rule->action], proxy_rule->port, proxy_rule->domain, proxy_rule->url)
+			LOGGER("--->rule reached, an action was added: M[%s]SSL[%s]ACTION[%s] :%d:%s:%s", PROXY_METHODS[proxy_rule->method], HTTP_SSL[proxy_rule->ssl], PROXY_ACTIONS[proxy_rule->action], proxy_rule->port, proxy_rule->domain, proxy_rule->url)
 		}
 	}
 	RETN_OK
 }
 
-bool send_request(bool is_ssl, int socket, pssl_layer ssl, pbuffer head_buffer, pbuffer body_buffer)
+bool send_request(pclient request, PROXY_FLOW flow, pbuffer head_buffer, pbuffer body_buffer)
 {
-	IF_GZERO(send_buffer(is_ssl, socket, ssl, head_buffer->pointer, head_buffer->written))
+	IF_GZERO(write_socket_buffer(request, flow, head_buffer->pointer, head_buffer->written))
 	if (body_buffer->written > 0){
-		IF_GZERO(send_buffer(is_ssl, socket, ssl, body_buffer->pointer, body_buffer->written))
+		IF_GZERO(write_socket_buffer(request, flow, body_buffer->pointer, body_buffer->written))
 	}
 	RETN_OK
 }
@@ -1594,14 +1719,14 @@ bool get_chunk_data(pclient request)
 		size = 0;
 		size_incomming = 0;
 		while (strstr(chunk_size, "\r\n") == 0 && size_incomming <= 20){
-			IF_GZERO(comming = input_buffer(request->ssl, request->sock_page, request->ssl_page, chunk_size + size_incomming, 1))
+			IF_GZERO(comming = read_socket_buffer(request, PAGE_TO_PROXY, chunk_size + size_incomming, 1))
 			size_incomming++;
 		}
 		if (sscanf(chunk_size, "%x\r\n", &size) != 1) RETN_FAIL
 		if (size == 0){
 			LOGGER("-->chunk completed!")
 			if (request->action != MODIFY_BODY_RESPONSE){
-				IF_GZERO(send_buffer(request->ssl, request->sock_browser, request->ssl_browser, const_char.endchunk, 5));
+				IF_GZERO(write_socket_buffer(request, PROXY_TO_CLIENT, const_char.endchunk, 5));
 			}
 			break;
 		}
@@ -1618,15 +1743,15 @@ bool get_chunk_data(pclient request)
 			}
 		}
 		while (total_received != size){
-			IF_GZERO(comming = input_buffer(request->ssl, request->sock_page, request->ssl_page, request->body_response.pointer + request->body_response.written, size - total_received))
+			IF_GZERO(comming = read_socket_buffer(request, PAGE_TO_PROXY, request->body_response.pointer + request->body_response.written, size - total_received))
 			total_received += comming;
 			request->body_response.written += comming;
 		}
-		IF_GZERO(input_buffer(request->ssl, request->sock_page, request->ssl_page, delimiter, 2))
+		IF_GZERO(read_socket_buffer(request, PAGE_TO_PROXY, delimiter, 2))
 		if (request->action != MODIFY_BODY_RESPONSE){
-			IF_GZERO(send_buffer(request->ssl, request->sock_browser, request->ssl_browser, chunk_size, size_incomming))
-			IF_GZERO(send_buffer(request->ssl, request->sock_browser, request->ssl_browser, request->body_response.pointer, request->body_response.written))
-			IF_GZERO(send_buffer(request->ssl, request->sock_browser, request->ssl_browser, "\r\n", 2))
+			IF_GZERO(write_socket_buffer(request, PROXY_TO_CLIENT, chunk_size, size_incomming))
+			IF_GZERO(write_socket_buffer(request, PROXY_TO_CLIENT, request->body_response.pointer, request->body_response.written))
+			IF_GZERO(write_socket_buffer(request, PROXY_TO_CLIENT, "\r\n", 2))
 		}
 		LOGGER("-->chunk received: size %d, written %d, size_incomming %d", total_received, request->body_response.written, size_incomming)
 	}
@@ -1637,11 +1762,11 @@ bool get_body_response(pclient request)
 {
 	request->stage = BODY_RESPONSE;
 	if (request->action != MODIFY_BODY_RESPONSE){
-		IF_GZERO(send_buffer(request->ssl, request->sock_browser, request->ssl_browser, request->head_response.pointer, request->head_response.written))
+		IF_GZERO(write_socket_buffer(request, PROXY_TO_CLIENT, request->head_response.pointer, request->head_response.written))
 	}
 	if (request->headers_response.chunked == false && request->headers_response.content_length > 0){
 		LOGGER("-->content length method: %d", request->headers_response.content_length)
-		IF_GZERO(get_body_request(request->ssl, request->sock_page, request->ssl_page, &request->body_response, request->headers_response.content_length, request))
+		IF_GZERO(get_body_request(request, PAGE_TO_PROXY, &request->body_response, request->headers_response.content_length))
 	} else if (request->headers_response.chunked){
 		LOGGER("-->chunk data method")
 		IF_GZERO(get_chunk_data(request))
@@ -1651,13 +1776,13 @@ bool get_body_response(pclient request)
 
 bool send_http_request(pclient request)
 {
-	return send_request(request->ssl, request->sock_page, request->ssl_page, &request->head_request, &request->body_request);
+	return send_request(request, PROXY_TO_PAGE, &request->head_request, &request->body_request);
 }
 
 bool send_new_response(pclient request)
 {
 	if (request->action == MODIFY_BODY_RESPONSE){
-		return send_request(request->ssl, request->sock_browser, request->ssl_browser, &request->head_response, &request->body_response);
+		return send_request(request, PROXY_TO_CLIENT, &request->head_response, &request->body_response);
 	}
 	RETN_OK
 }
@@ -1665,7 +1790,7 @@ bool send_new_response(pclient request)
 bool get_head_response(pclient request)
 {
 	request->stage = HEAD_RESPONSE;
-	IF_GZERO(get_headers_request(request->ssl, request->sock_page, request->ssl_page, &request->head_response))
+	IF_GZERO(get_headers_request(request, PAGE_TO_PROXY, &request->head_response))
 	sscanf(request->head_response.pointer, const_char.parse_response_code, &request->response_code);
 	parse_headers(&request->head_response, &request->headers_response);
 	apply_action(request);
@@ -1677,6 +1802,12 @@ bool get_http_request(pclient request)
 	IF_GZERO(get_request(request))
 	IF_GZERO(get_info_request(request))
 	LOGGER("-->hostname %s, port %d, url %s, ssl %s, method %s, head size %d, body size %d", request->info.hostname, request->info.port, request->info.url, HTTP_SSL[request->ssl], PROXY_METHODS[request->method], request->head_request.written, request->body_request.written)
+	#ifndef OPENSSL
+		if(request->ssl){
+			LOGGER("-->https is not support.")
+			RETN_FAIL
+		}
+	#endif
 	check_action(request);
 	return (apply_action(request) == REJECT) ? false : true;
 }
@@ -1699,25 +1830,26 @@ u_int socket_tunnel(pclient request)
 		timeout.tv_sec = proxy_config.timeout_tunnel;
 		IF_GZERO(select(maxfd + 1, &rd_set, 0, 0, &timeout))
 		if(FD_ISSET(request->sock_page, &rd_set)) {
-			IF_GZERO(nread = input_buffer(request->ssl, request->sock_page, request->ssl_page, buffer, __INIT_SIZE_BUFFER))
-			IF_GZERO(nsent = send_buffer(request->ssl, request->sock_browser, request->ssl_browser, buffer, nread))
+			IF_GZERO(nread = read_socket_buffer(request, PAGE_TO_PROXY, buffer, __INIT_SIZE_BUFFER))
+			IF_GZERO(nsent = write_socket_buffer(request, PROXY_TO_CLIENT, buffer, nread))
 		}
 		if(FD_ISSET(request->sock_browser, &rd_set)){
-			IF_GZERO(nread = input_buffer(request->ssl, request->sock_browser, request->ssl_browser, buffer, __INIT_SIZE_BUFFER))
-			IF_GZERO(nsent = send_buffer(request->ssl, request->sock_page, request->ssl_page, buffer, nread))
+			IF_GZERO(nread = read_socket_buffer(request, CLIENT_TO_PROXY, buffer, __INIT_SIZE_BUFFER))
+			IF_GZERO(nsent = write_socket_buffer(request, PROXY_TO_PAGE, buffer, nread))
 		}
 	}
 	RETN_OK
 }
 
-bool handle_client(int client_socket)
+bool handle_client(void* connection)
 {
 	pclient request = 0;
 
 	CHECK_OP(alloc_request(&request))
-	request->sock_browser = (SOCKET)client_socket;
+	memcpy((void*)&request->connection, connection, sizeof(client_connection));
+	request->sock_browser = request->connection.client_socket;
 	request->action = DIRECT;
-	request->thread_id = GetCurrentThreadId();
+	request->thread_id = pthread_self();
 	CHECK_OP(set_socket_timeout(request->sock_browser, proxy_config.timeout_tunnel))
 
 	keep_alive:
@@ -1751,6 +1883,8 @@ bool handle_client(int client_socket)
 		//printer(request->head_response.pointer, request->head_response.written);
 		//printer(request->body_response.pointer, request->body_response.written);
 		CHECK_OP(send_new_response(request))
+		request->stage = FINISHED;
+		apply_action(request);
 		if (request->headers_response.connection.keep_alive){
 			reset_request(request);
 			goto keep_alive;
@@ -1761,7 +1895,13 @@ bool handle_client(int client_socket)
 		}
 		goto __finally;
 	__exception:
-		LOGGER("__exception: %s, stage: %s", request->ssl_error, PROXY_STAGES[request->stage])
+		LOGGER(
+			#ifdef OPENSSL
+				"__exception: %d ssl: %s, stage: %s", GET_SYSTEM_ERROR(), request->ssl_error, PROXY_STAGES[request->stage]
+			#else
+				"__exception: %d stage: %s", GET_SYSTEM_ERROR(), PROXY_STAGES[request->stage]
+			#endif
+			)
 	__finally:
 		close_handle(request);
 		RETN_OK
@@ -1928,17 +2068,6 @@ phead make_head_data(char* header)
 	return nhead;
 }
 
-u_int get_size_file(char* path)
-{
-	WIN32_FILE_ATTRIBUTE_DATA fad = {0};
-	LARGE_INTEGER size = {0};
-
-	if(!GetFileAttributesEx(path, GetFileExInfoStandard, &fad)) return 0;
-	size.HighPart = fad.nFileSizeHigh;
-	size.LowPart = fad.nFileSizeLow;
-	return size.QuadPart;
-}
-
 u_int get_rule_info(prule proxy_rule, char* config_line)
 {
 	u_int lentgh_action = 0;
@@ -1948,8 +2077,10 @@ u_int get_rule_info(prule proxy_rule, char* config_line)
 			proxy_rule->action = REDIRECT;
 		} else if (strnstr(config_line, lentgh_action, PROXY_ACTIONS[CAPTURE], 7)){
 			proxy_rule->action = CAPTURE;
-		} else if (strnstr(config_line, lentgh_action, PROXY_ACTIONS[MODIFY_BODY_RESPONSE], 6)){
+		} else if (strnstr(config_line, lentgh_action, PROXY_ACTIONS[MODIFY_BODY_RESPONSE], 20)){
 			proxy_rule->action = MODIFY_BODY_RESPONSE;
+		} else if (strnstr(config_line, lentgh_action, PROXY_ACTIONS[MODIFY_BODY_REQUEST], 19)){
+			proxy_rule->action = MODIFY_BODY_REQUEST;
 		} else if (strnstr(config_line, lentgh_action, PROXY_ACTIONS[SCREENSHOT], 10)){
 			proxy_rule->action = SCREENSHOT;
 		} else if (strnstr(config_line, lentgh_action, PROXY_ACTIONS[FAKE_TLS_EXT_HOSTNAME], 21)){
@@ -2013,6 +2144,7 @@ bool load_proxy_rules()
 				CHECK_ALLOC(rule, calloc, proxy_rule, 1)
 				CHECK_OP(get_rule_info(proxy_rule, config_line));
 				switch (proxy_rule->action){
+					case MODIFY_BODY_REQUEST:
 					case MODIFY_BODY_RESPONSE:
 						if (sscanf(config_line, "%*[^" DELIMITER_RULE_INFO "]" DELIMITER_RULE_INFO "%*[^" DELIMITER_RULE_INFO "]" DELIMITER_RULE_INFO "%" IN2STR(MAX_URL_SIZE) "[^" DELIMITER_RULE_INFO "]" DELIMITER_RULE_INFO "%" IN2STR(MAX_ARG_1_SIZE) "[^" DELIMITER_RULE_INFO "]" DELIMITER_RULE_INFO "%" IN2STR(MAX_ARG_2_SIZE) "[^\n]\n", proxy_rule->url, arg_1, arg_2) != 3){
 							goto __exception;
@@ -2043,7 +2175,7 @@ bool load_proxy_rules()
 						break;
 				}
 				if (parse_url(proxy_rule)){
-					if (proxy_rule->action == MODIFY_BODY_RESPONSE){
+					if (proxy_rule->action == MODIFY_BODY_RESPONSE || MODIFY_BODY_REQUEST == proxy_rule->action){
 						proxy_rule->extra_data = make_inject_data(arg_1, arg_2);
 					} else if (proxy_rule->action == REDIRECT){
 						proxy_rule->extra_data = make_redirect_data(arg_1, arg_3);
@@ -2075,9 +2207,10 @@ bool load_proxy_rules()
 		ITER_LLIST(proxy_rule, proxy_config.proxy_rules){
 			count++;
 			switch (proxy_rule->action){
+				case MODIFY_BODY_REQUEST:
 				case MODIFY_BODY_RESPONSE:
-					LOGGER("(#%d)[MODIFY_BODY_RESPONSE] [%s] [%s] [%d] [%s] [%s] [%s] [%s]", 
-							count, PROXY_METHODS[proxy_rule->method], HTTP_SSL[proxy_rule->ssl], proxy_rule->port, proxy_rule->domain, proxy_rule->url, 
+					LOGGER("(#%d)[%s] [%s] [%s] [%d] [%s] [%s] [%s] [%s]", 
+							count, PROXY_ACTIONS[proxy_rule->action], PROXY_METHODS[proxy_rule->method], HTTP_SSL[proxy_rule->ssl], proxy_rule->port, proxy_rule->domain, proxy_rule->url, 
 							((pinjection)proxy_rule->extra_data)->prefix, ((pinjection)proxy_rule->extra_data)->inject)
 					break;
 				case REDIRECT:
@@ -2118,18 +2251,22 @@ bool load_proxy_rules()
 	generate_pac_response();
 	RETN_OK
 	__exception:
-		LOGGER("->it was a error parsing the settings, line: %d, string: (%s)", line, config_line)
+		LOGGER("->it was an error parsing the settings, line: %d, string: (%s)", line, config_line)
 		RETN_FAIL
 }
 
 bool start_http_proxy()
 {
-	struct sockaddr_in client_addr = {0};
 	struct sockaddr_in proxy_addr = {0};
-	WSADATA wsd = {0};
+	client_connection connection = {0};
+	#ifdef _WIN32
+		WSADATA wsd = {0};
+	#else
+		pthread_t id = 0;
+	#endif
 	int dummy_struct_size = 0;
 	int opt_reuse = 1;
-	SOCKET client_socket = 0;
+	int client_socket = 0;
 	#ifdef THREAD_POOL
 		pthread_pool pool = 0;
 	#endif
@@ -2138,8 +2275,9 @@ bool start_http_proxy()
 	proxy_addr.sin_family = 2;
 	proxy_addr.sin_port = htons(proxy_config.port);
 	proxy_addr.sin_addr.s_addr = inet_addr(proxy_config._interface);
-
-	CHECK_OP(!WSAStartup(MAKEWORD(2, 2), &wsd))
+	#ifdef _WIN32
+		CHECK_OP(!WSAStartup(MAKEWORD(2, 2), &wsd))
+	#endif
 	IF_GZERO(proxy_config.socket = socket(2, 1, 0))
 	CHECK_OP(!setsockopt(proxy_config.socket, SOL_SOCKET, SO_REUSEADDR, (char*)&opt_reuse, sizeof(int)))
 	CHECK_OP(!bind(proxy_config.socket, (struct sockaddr*)&proxy_addr, sizeof(proxy_addr)))
@@ -2154,26 +2292,31 @@ bool start_http_proxy()
 		}
 	#endif
 	while (true){
-		client_socket = accept(proxy_config.socket, (struct sockaddr*)&client_addr, &dummy_struct_size);
+		connection.client_socket = accept(proxy_config.socket, (struct sockaddr*)&connection.client_addr, &dummy_struct_size);
 		#ifdef THREAD_POOL
 			add_pool_job(pool, client_socket);
 		#else
-			CloseHandle(CreateThread(0, 0, (LPTHREAD_START_ROUTINE)handle_client, (void*)client_socket, 0, 0));
+			#ifdef _WIN32
+				CloseHandle(CreateThread(0, 0, (LPTHREAD_START_ROUTINE)handle_client, (void*)&connection, 0, 0));
+			#else
+				pthread_create(&id, 0, (void*)handle_client, (void*)&connection);
+				pthread_detach(id);
+			#endif
 		#endif
 	}
 	__exception:
-		LOGGER("->it was a error starting proxy, error (%lu).", GetLastError())
+		LOGGER("->it was an error starting proxy, error (%lu).", GET_SYSTEM_ERROR())
 	RETN_OK
 }
 
 int main(int argc, char** argv)
 {
 	#ifdef DNS_MEM_CACHE
-		InitializeCriticalSection(&proxy_config.domain_cache_lock);
+		pthread_mutex_init(&proxy_config.domain_cache_lock, 0);
 	#endif
-	InitializeCriticalSection(&proxy_config.certificate_cache_lock);
+	pthread_mutex_init(&proxy_config.certificate_cache_lock, 0);
 	#ifdef DEBUG
-		InitializeCriticalSection(&proxy_config.stdout_lock);
+		pthread_mutex_init(&proxy_config.stdout_lock, 0);
 	#endif
 	LOGGER("->h2Polar by %s V:%s", __AUTHOR, __VERSION)
 	load_strings();
